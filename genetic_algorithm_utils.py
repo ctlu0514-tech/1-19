@@ -120,7 +120,7 @@ def mutation(chromosome, id, mutation_rate=0.05):
 
     return repaired_chromosome
 
-def repair(chromosome, clusters, omega, normalized_fisher_scores):
+def repair(chromosome, clusters, omega, normalized_fisher_scores, max_per_cluster=50):
     """
     修复操作：确保染色体中每个簇的特征数量恰好等于 omega_cluster，
     并按 Fisher 分数从高到低添加/移除特征。
@@ -129,14 +129,15 @@ def repair(chromosome, clusters, omega, normalized_fisher_scores):
     :param clusters: 簇信息，每个簇为一个特征索引的列表
     :param omega: 每个簇允许的最大特征比例（小数，例如 0.2 表示 20%）
     :param normalized_fisher_scores: 归一化后的 Fisher Score，字典形式 {feature_index: score}
+    :param max_per_cluster: 每个簇选择的最大特征数量上限（防止巨型社区过拟合）
     :return: 修复后的染色体（numpy 数组）
     """
     repaired_chromosome = chromosome.copy()
 
     for cluster in clusters:
         cluster_size = len(cluster)
-        # 计算该簇允许的特征数量（至少 1 个）
-        omega_cluster = max(1, int(cluster_size * omega))
+        # 计算该簇允许的特征数量（至少 1 个，且不超过 max_per_cluster）
+        omega_cluster = min(max(1, int(cluster_size * omega)), max_per_cluster)
 
         # 找出该簇中当前被选中的特征列表
         selected_features = [i for i in cluster if repaired_chromosome[i] == 1]

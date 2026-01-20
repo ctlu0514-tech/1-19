@@ -111,7 +111,7 @@ def load_and_split(
     center_col: Optional[str] = None,
     train_centers: Optional[List[str]] = None,
     id_col: Optional[str] = None,
-    val_size: float = 0.2,
+    val_size: float = 0.3,
     random_state: int = 42,
 ) -> Tuple[Dict[str, Tuple[pd.DataFrame, np.ndarray]], List[str], str]:
     """
@@ -318,6 +318,8 @@ def run_feature_selection(
     cdgafs_pop: int = 100,
     cdgafs_theta: float = 0.9,
     cdgafs_omega: float = 0.5,
+    use_semantic: bool = False,
+    max_cluster_size: int = 200,
 ) -> np.ndarray:
     method = method.upper()
     start_t = time.time()
@@ -376,17 +378,18 @@ def run_feature_selection(
         try:
             sel_idx, *_ = cdgafs_feature_selection(
                 X=X_train, y=y_train, feature_list=feature_names,
-                theta=cdgafs_theta, omega=cdgafs_omega, population_size=cdgafs_pop
+                theta=cdgafs_theta, omega=cdgafs_omega, population_size=cdgafs_pop,
+                use_semantic_clustering=use_semantic, max_cluster_size=max_cluster_size
             )
-            sel_idx = list(sel_idx) if sel_idx is not None else []
-            if len(sel_idx) > K:
+            selected_idx = list(sel_idx) if sel_idx is not None else []
+            if len(selected_idx) > K:
                 # prune to K by RFE on the subspace
                 est = LogisticRegression(solver="liblinear", class_weight="balanced", random_state=42)
                 rfe = RFE(est, n_features_to_select=K, step=1)
-                rfe.fit(X_train[:, sel_idx], y_train)
-                selected_idx = np.array(sel_idx)[rfe.support_].tolist()
+                rfe.fit(X_train[:, selected_idx], y_train)
+                selected_idx = np.array(selected_idx)[rfe.support_].tolist()
             else:
-                selected_idx = sel_idx
+                selected_idx = selected_idx
         except Exception as e:
             print(f"  [CDGAFS] failed: {e}")
             selected_idx = []
@@ -404,8 +407,8 @@ def run_feature_selection(
 
     # Safety bounds
     selected_idx_arr = selected_idx_arr[(selected_idx_arr >= 0) & (selected_idx_arr < X_train.shape[1])]
-    if len(selected_idx_arr) > K:
-        selected_idx_arr = selected_idx_arr[:K]
+    # if len(selected_idx_arr) > K:
+    #     selected_idx_arr = selected_idx_arr[:K]
 
     print(f"[Select] {method} | selected={len(selected_idx_arr)} | time={elapsed:.2f}s")
     return selected_idx_arr
@@ -460,10 +463,10 @@ def evaluate_model(
 
 CONFIG = {
     # 数据路径（支持 .csv 或 .gz 的 gzip 压缩 CSV）
-    "csv": "/data/qh_20T_share_file/lct/CT67/dataset/WORC-GIST.gz",
+    "csv": "/data/qh_20T_share_file/lct/CT67/localdata/prostate_features_with_label.csv",
 
     # 列名
-    "label": "Target",
+    "label": "label",
     "id_col": "ID",
 
     # auto / single / multi
@@ -478,19 +481,22 @@ CONFIG = {
     "train_centers": "FuYi",       # 例如 "FuYi,Ningbo"
 
     # 拆分与随机种子
-    "val_size": 0.20,
+    "val_size": 0.30,
     "seed": 42,
 
     # 方法与超参
-    "methods": "CDGAFS,LASSO,RFE,MRMR",
-    "k": 10,
+    "methods": "CDGAFS,LASSO,MRMR",
+    "k": 50,
     "var_threshold": 1e-10,
-    "rfe_step": 0.05,
+    "rfe_step": 1,
 
     # CDGAFS 超参（仅在安装了 CDGAFS 且 methods 包含 CDGAFS 时生效）
     "cdgafs_pop": 100,
     "cdgafs_theta": 0.9,
-    "cdgafs_omega": 0.5,
+    "cdgafs_omega": 0.05,
+    "use_semantic": True,       # 是否使用语义预聚类替代 ISCD
+    "max_cluster_size": 200,     # 语义聚类单组最大特征数
+    "max_per_cluster": 50,       # 每个社区选择的最大特征数
 
     # 输出 CSV（相对路径：保存到当前工作目录）
     "out": "validation_summary.csv",
@@ -508,6 +514,14 @@ def main():
     parser.add_argument("--methods", type=str, default=CONFIG["methods"], help="Methods (comma-separated)")
     parser.add_argument("--k", type=int, default=CONFIG["k"], help="Number of features to select")
     parser.add_argument("--out", type=str, default=CONFIG["out"], help="Output CSV file path")
+    parser.add_argument("--use_semantic", type=str, default=str(CONFIG["use_semantic"]),
+                        help="Use semantic pre-clustering ('True' or 'False')")
+    parser.add_argument("--max_cluster_size", type=int, default=CONFIG["max_cluster_size"],
+                        help="Max features per semantic cluster before sub-division")
+    parser.add_argument("--max_per_cluster", type=int, default=CONFIG["max_per_cluster"],
+                        help="Max features to select from each cluster")
+    parser.add_argument("--cdgafs_omega", type=float, default=CONFIG["cdgafs_omega"],
+                        help="CDGAFS omega parameter (proportion of features per cluster)")
     args = parser.parse_args()
 
     cfg = dict(CONFIG)  # shallow copy, safe to edit locally
@@ -524,6 +538,12 @@ def main():
         cfg['methods'] = args.methods
     cfg['k'] = args.k
     cfg['out'] = args.out
+    
+    # Parse boolean
+    cfg['use_semantic'] = (str(args.use_semantic).lower() == 'true')
+    cfg['max_cluster_size'] = args.max_cluster_size
+    cfg['max_per_cluster'] = args.max_per_cluster
+    cfg['cdgafs_omega'] = args.cdgafs_omega
 
     # Normalize lists
     train_centers = None
@@ -549,7 +569,7 @@ def main():
     X_train, y_train = datasets["Train"]
 
     print("=" * 72)
-    print(f"Validation start | mode={resolved_mode} | K={cfg['k']} | methods={methods}")
+    print(f"Validation start | mode={resolved_mode} | K={cfg['k']} | omega={cfg['cdgafs_omega']} | methods={methods}")
     print("=" * 72)
 
     summary_rows = []
@@ -564,6 +584,8 @@ def main():
             cdgafs_pop=cfg['cdgafs_pop'],
             cdgafs_theta=cfg['cdgafs_theta'],
             cdgafs_omega=cfg['cdgafs_omega'],
+            use_semantic=cfg['use_semantic'],
+            max_cluster_size=cfg['max_cluster_size'],
         )
 
         selected_names = [feature_names[i] for i in sel_idx]

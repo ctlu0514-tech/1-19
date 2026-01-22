@@ -8,7 +8,7 @@ from construct_feature_graph import construct_pearson_only_graph
 from compute_similarity_matrix import compute_similarity_matrix
 from community_detection import iscd_algorithm_auto_k
 from calculate_fitness import calculate_fitness 
-from genetic_algorithm_utils import initialize_population, genetic_algorithm
+from genetic_algorithm_utils import initialize_population, genetic_algorithm, allocate_quota_by_quality
 from final_subset_selection import final_subset_selection
 from genetic_algorithm_utils import set_random_seed
 
@@ -57,7 +57,9 @@ def semantic_pre_clustering(feature_names, max_cluster_size=200):
 
 
 def cdgafs_feature_selection(X, y, feature_list, theta, omega, population_size,
-                              use_semantic_clustering=False, max_cluster_size=200):
+                              use_semantic_clustering=False, max_cluster_size=200,
+                              use_quality_quota=False, target_k=50, 
+                              top_cluster_ratio=0.5, temperature=10.0):
     """
     执行特征选择流程（建图、社团检测/语义聚类、GA）。
 
@@ -66,10 +68,14 @@ def cdgafs_feature_selection(X, y, feature_list, theta, omega, population_size,
         y (np.ndarray): 标签
         feature_list (list): 特征名称列表
         theta (float): 建图阈值 (仅在 use_semantic_clustering=False 时使用)
-        omega (float): 社团内特征选择比例
+        omega (float): 社团内特征选择比例（当 use_quality_quota=False 时使用）
         population_size (int): 种群大小
         use_semantic_clustering (bool): 是否使用语义预聚类替代 ISCD
         max_cluster_size (int): 语义聚类时单个组的最大特征数
+        use_quality_quota (bool): 是否使用方案C质量加权配额分配
+        target_k (int): 目标选择特征数（仅在 use_quality_quota=True 时使用）
+        top_cluster_ratio (float): 筛选的高质量社区比例（如0.5表示选Top 50%）
+        temperature (float): Softmax 温度参数，越大权重差异越大
         
     返回: (元组)
         selected_original_indices (list): GA选出的最终特征索引
@@ -128,15 +134,33 @@ def cdgafs_feature_selection(X, y, feature_list, theta, omega, population_size,
     # Step 4: 初始化种群并执行遗传算法
     print("\nStep 4: 执行遗传算法...")
     num_features_subset = X_subset.shape[1]
-    population = initialize_population(num_features_subset, clusters, omega, population_size)
+    
+    # 计算配额（方案C质量加权或传统omega模式）
+    cluster_quotas = None
+    if use_quality_quota:
+        print(f"  [方案C质量加权配额] target_k={target_k}, top_ratio={top_cluster_ratio}, temp={temperature}")
+        cluster_quotas = allocate_quota_by_quality(
+            clusters, fisher_scores_subset, target_k, 
+            top_cluster_ratio=top_cluster_ratio, temperature=temperature
+        )
+    
+    population = initialize_population(
+        num_features_subset, clusters, omega, population_size, 
+        cluster_quotas=cluster_quotas
+    )
     print(f"初始化种群大小: {len(population)}")
+    
+    # 统计初始种群特征数
+    avg_features = np.mean([np.sum(c) for c in population])
+    print(f"初始种群平均特征数: {avg_features:.1f}")
     
     fitness_values = calculate_fitness(population, X_subset, y, similarity_matrix, n_jobs=10)
     print(f"初始适应度值示例: {fitness_values[:5]}")
 
     population, fitness_values = genetic_algorithm(
         population, fitness_values, X_subset, y, clusters, omega, 
-        similarity_matrix, population_size, num_features_subset, normalized_fisher_scores
+        similarity_matrix, population_size, num_features_subset, normalized_fisher_scores,
+        cluster_quotas=cluster_quotas
     )
     
     # Step 5: 选择最终特征子集

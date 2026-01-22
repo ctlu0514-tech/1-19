@@ -320,6 +320,9 @@ def run_feature_selection(
     cdgafs_omega: float = 0.5,
     use_semantic: bool = False,
     max_cluster_size: int = 200,
+    use_quality_quota: bool = False,
+    top_cluster_ratio: float = 0.5,
+    temperature: float = 10.0,
 ) -> np.ndarray:
     method = method.upper()
     start_t = time.time()
@@ -379,7 +382,9 @@ def run_feature_selection(
             sel_idx, *_ = cdgafs_feature_selection(
                 X=X_train, y=y_train, feature_list=feature_names,
                 theta=cdgafs_theta, omega=cdgafs_omega, population_size=cdgafs_pop,
-                use_semantic_clustering=use_semantic, max_cluster_size=max_cluster_size
+                use_semantic_clustering=use_semantic, max_cluster_size=max_cluster_size,
+                use_quality_quota=use_quality_quota, target_k=K, 
+                top_cluster_ratio=top_cluster_ratio, temperature=temperature
             )
             selected_idx = list(sel_idx) if sel_idx is not None else []
             if len(selected_idx) > K:
@@ -497,6 +502,9 @@ CONFIG = {
     "use_semantic": True,       # 是否使用语义预聚类替代 ISCD
     "max_cluster_size": 200,     # 语义聚类单组最大特征数
     "max_per_cluster": 50,       # 每个社区选择的最大特征数
+    "use_quality_quota": True,   # 是否使用方案C质量加权配额分配
+    "top_cluster_ratio": 0.5,    # 筛选的高质量社区比例 (Top N%)
+    "temperature": 10.0,         # Softmax 温度参数，越大权重差异越大
 
     # 输出 CSV（相对路径：保存到当前工作目录）
     "out": "validation_summary.csv",
@@ -522,6 +530,12 @@ def main():
                         help="Max features to select from each cluster")
     parser.add_argument("--cdgafs_omega", type=float, default=CONFIG["cdgafs_omega"],
                         help="CDGAFS omega parameter (proportion of features per cluster)")
+    parser.add_argument("--use_quality_quota", type=str, default=str(CONFIG["use_quality_quota"]),
+                        help="Use Plan C quality-weighted quota allocation ('True' or 'False')")
+    parser.add_argument("--top_cluster_ratio", type=float, default=CONFIG["top_cluster_ratio"],
+                        help="Top cluster ratio for Plan C (e.g., 0.5 for Top 50%%)")
+    parser.add_argument("--temperature", type=float, default=CONFIG["temperature"],
+                        help="Softmax temperature for weighted sampling (higher = more contrast)")
     args = parser.parse_args()
 
     cfg = dict(CONFIG)  # shallow copy, safe to edit locally
@@ -544,6 +558,9 @@ def main():
     cfg['max_cluster_size'] = args.max_cluster_size
     cfg['max_per_cluster'] = args.max_per_cluster
     cfg['cdgafs_omega'] = args.cdgafs_omega
+    cfg['use_quality_quota'] = (str(args.use_quality_quota).lower() == 'true')
+    cfg['top_cluster_ratio'] = args.top_cluster_ratio
+    cfg['temperature'] = args.temperature
 
     # Normalize lists
     train_centers = None
@@ -586,10 +603,13 @@ def main():
             cdgafs_omega=cfg['cdgafs_omega'],
             use_semantic=cfg['use_semantic'],
             max_cluster_size=cfg['max_cluster_size'],
+            use_quality_quota=cfg['use_quality_quota'],
+            top_cluster_ratio=cfg['top_cluster_ratio'],
+            temperature=cfg['temperature'],
         )
 
         selected_names = [feature_names[i] for i in sel_idx]
-        print(f"  Features({len(selected_names)}): {selected_names}")
+        # print(f"  Features({len(selected_names)}): {selected_names}")
 
         scores = evaluate_model(datasets, sel_idx)
 

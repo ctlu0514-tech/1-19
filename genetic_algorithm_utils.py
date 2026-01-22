@@ -7,14 +7,148 @@ def set_random_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
 
-def initialize_population(num_features, clusters, omega, population_size):
+
+def allocate_quota_by_quality(clusters, fisher_scores, total_k, 
+                               top_cluster_ratio=0.5, temperature=10.0):
+    """
+    方案C: 两阶段配额分配（筛选 + 加权采样）
+    
+    1. 阶段1: 筛选 Top N 个高质量社区
+    2. 阶段2: 在筛选后的社区内使用加权采样分配配额
+    
+    高质量社区可获得多个配额，低质量社区获得 0 配额。
+    使用原始 Fisher Score（非归一化）以保留最大差异。
+    
+    Args:
+        clusters (list): 社区列表，每个元素是特征索引列表
+        fisher_scores (np.ndarray): 原始 Fisher Scores（非归一化）
+        total_k (int): 总共需要选择的特征数
+        top_cluster_ratio (float): 筛选的高质量社区比例（如0.5表示选Top 50%）
+        temperature (float): Softmax 温度参数，越大权重差异越大
+    
+    Returns:
+        list: 每个社区的配额列表（长度与 clusters 相同）
+    """
+    n_clusters = len(clusters)
+    
+    # 计算每个社区的平均 Fisher Score（使用原始分数）
+    cluster_avg_scores = []
+    cluster_sizes = []
+    for cluster in clusters:
+        cluster_sizes.append(len(cluster))
+        if len(cluster) > 0:
+            avg_score = np.mean([fisher_scores[f] for f in cluster])
+        else:
+            avg_score = 0.0
+        cluster_avg_scores.append(avg_score)
+    
+    cluster_avg_scores = np.array(cluster_avg_scores)
+    cluster_sizes = np.array(cluster_sizes)
+    
+    print(f"\n{'='*60}")
+    print(f"[方案C: 两阶段配额分配] 目标特征数: {total_k}")
+    print(f"{'='*60}")
+    print(f"  社区数量: {n_clusters}")
+    print(f"  社区平均质量: min={cluster_avg_scores.min():.6f}, "
+          f"max={cluster_avg_scores.max():.6f}, mean={cluster_avg_scores.mean():.6f}")
+    
+    # ========== 阶段1: 筛选高质量社区 ==========
+    # 计算需要激活的社区数（至少等于 total_k，确保有足够的社区）
+    n_active = max(total_k, int(n_clusters * top_cluster_ratio))
+    n_active = min(n_active, n_clusters)  # 不能超过总社区数
+    
+    # 按质量排序，选择 Top N 个社区
+    sorted_indices = np.argsort(cluster_avg_scores)[::-1]
+    active_indices = sorted_indices[:n_active]
+    inactive_indices = sorted_indices[n_active:]
+    
+    print(f"\n  阶段1: 社区筛选")
+    print(f"    激活社区数: {n_active}/{n_clusters} (top {100*n_active/n_clusters:.1f}%)")
+    print(f"    激活社区质量范围: {cluster_avg_scores[active_indices[-1]]:.6f} ~ "
+          f"{cluster_avg_scores[active_indices[0]]:.6f}")
+    if len(inactive_indices) > 0:
+        print(f"    被排除社区质量范围: {cluster_avg_scores[inactive_indices[-1]]:.6f} ~ "
+              f"{cluster_avg_scores[inactive_indices[0]]:.6f}")
+    
+    # ========== 阶段2: 加权采样分配配额 ==========
+    # 计算激活社区的 Softmax 权重
+    active_scores = cluster_avg_scores[active_indices]
+    
+    # Softmax with temperature (避免数值溢出)
+    scaled_scores = active_scores * temperature
+    scaled_scores = scaled_scores - np.max(scaled_scores)  # 数值稳定性
+    exp_scores = np.exp(scaled_scores)
+    weights = exp_scores / exp_scores.sum()
+    
+    print(f"\n  阶段2: 加权采样分配")
+    print(f"    温度参数: {temperature}")
+    print(f"    权重范围: min={weights.min():.4f}, max={weights.max():.4f}")
+    
+    # 初始化配额
+    quotas = np.zeros(n_clusters, dtype=int)
+    
+    # 逐个分配配额（允许同一社区被多次选中）
+    remaining_capacity = cluster_sizes.copy()  # 每个社区的剩余容量
+    
+    for _ in range(total_k):
+        # 检查哪些激活社区还有容量
+        available_mask = remaining_capacity[active_indices] > 0
+        if not np.any(available_mask):
+            print(f"    ⚠️ 所有激活社区已满，提前终止分配")
+            break
+        
+        # 只在有容量的社区中采样
+        available_indices = np.where(available_mask)[0]
+        available_weights = weights[available_indices]
+        available_weights = available_weights / available_weights.sum()  # 重新归一化
+        
+        # 加权随机选择
+        chosen_local = np.random.choice(available_indices, p=available_weights)
+        chosen_global = active_indices[chosen_local]
+        
+        quotas[chosen_global] += 1
+        remaining_capacity[chosen_global] -= 1
+    
+    # ========== 打印结果 ==========
+    nonzero_quotas = quotas[quotas > 0]
+    print(f"\n  配额分配结果:")
+    print(f"    非零配额社区: {len(nonzero_quotas)}/{n_clusters}")
+    print(f"    总配额分配: {np.sum(quotas)}/{total_k}")
+    if len(nonzero_quotas) > 0:
+        print(f"    配额分布: min={nonzero_quotas.min()}, max={nonzero_quotas.max()}, "
+              f"mean={nonzero_quotas.mean():.1f}")
+    
+    # 打印所有有配额的社区（按配额从高到低排序）
+    sorted_quota_indices = np.argsort(quotas)[::-1]
+    nonzero_count = np.sum(quotas > 0)
+    print(f"\n  所有有配额社区 ({nonzero_count}个):")
+    for rank, idx in enumerate(sorted_quota_indices, 1):
+        if quotas[idx] > 0:
+            print(f"    #{rank}: 社区{idx} | 配额={quotas[idx]} | "
+                  f"大小={cluster_sizes[idx]} | 质量={cluster_avg_scores[idx]:.6f}")
+    
+    # 打印被跳过的社区
+    zero_quota_mask = quotas == 0
+    n_skipped = np.sum(zero_quota_mask)
+    if n_skipped > 0:
+        skipped_scores = cluster_avg_scores[zero_quota_mask]
+        print(f"\n  被跳过的社区 (配额=0):")
+        print(f"    数量: {n_skipped}")
+        print(f"    质量范围: {skipped_scores.min():.6f} ~ {skipped_scores.max():.6f}")
+    
+    print(f"{'='*60}\n")
+    
+    return quotas.tolist()
+
+def initialize_population(num_features, clusters, omega, population_size, cluster_quotas=None):
     """
     初始化种群。
     Args:
         num_features (int): 原始特征总数。
         clusters (list): 每个簇包含的特征索引列表。
-        omega (int): 每个簇中选取的特征数百分比。
+        omega (float): 每个簇中选取的特征数百分比（当 cluster_quotas 为 None 时使用）。
         population_size (int): 种群大小。
+        cluster_quotas (list, optional): 每个簇的配额列表。如果提供，则忽略 omega。
     Returns:
         list: 初始化的种群，每个个体是一个染色体（特征选择向量）。
     """
@@ -22,10 +156,23 @@ def initialize_population(num_features, clusters, omega, population_size):
     
     for _ in range(population_size):
         chromosome = np.zeros(num_features, dtype=int)  # 初始化染色体为全0
-        for cluster_features in clusters:  # 遍历每个簇
-            # 在该簇中随机选择 ω% 个特征
-            selected_features = np.random.choice(cluster_features, size=int(omega * len(cluster_features)), replace=False)
-            chromosome[selected_features] = 1  # 将选中的特征置为1
+        for i, cluster_features in enumerate(clusters):  # 遍历每个簇
+            if cluster_quotas is not None:
+                # 使用质量加权配额
+                quota = cluster_quotas[i]
+            else:
+                # 使用传统 omega 比例
+                quota = int(omega * len(cluster_features))
+            
+            # 确保配额不超过簇大小
+            quota = min(quota, len(cluster_features))
+            
+            if quota > 0:
+                # 在该簇中随机选择特征
+                selected_features = np.random.choice(
+                    cluster_features, size=quota, replace=False
+                )
+                chromosome[selected_features] = 1  # 将选中的特征置为1
         population.append(chromosome)
     
     return population
@@ -120,27 +267,33 @@ def mutation(chromosome, id, mutation_rate=0.05):
 
     return repaired_chromosome
 
-def repair(chromosome, clusters, omega, normalized_fisher_scores, max_per_cluster=50):
+def repair(chromosome, clusters, omega, normalized_fisher_scores, max_per_cluster=50, cluster_quotas=None):
     """
-    修复操作：确保染色体中每个簇的特征数量恰好等于 omega_cluster，
+    修复操作：确保染色体中每个簇的特征数量符合配额要求，
     并按 Fisher 分数从高到低添加/移除特征。
     
     :param chromosome: 二进制编码的染色体（numpy 数组，0 表示未选，1 表示选中）
     :param clusters: 簇信息，每个簇为一个特征索引的列表
-    :param omega: 每个簇允许的最大特征比例（小数，例如 0.2 表示 20%）
-    :param normalized_fisher_scores: 归一化后的 Fisher Score，字典形式 {feature_index: score}
+    :param omega: 每个簇允许的最大特征比例（当 cluster_quotas 为 None 时使用）
+    :param normalized_fisher_scores: 归一化后的 Fisher Score，数组形式
     :param max_per_cluster: 每个簇选择的最大特征数量上限（防止巨型社区过拟合）
+    :param cluster_quotas: 每个簇的配额列表（如果提供，则忽略 omega）
     :return: 修复后的染色体（numpy 数组）
     """
     repaired_chromosome = chromosome.copy()
 
-    for cluster in clusters:
+    for i, cluster in enumerate(clusters):
         cluster_size = len(cluster)
-        # 计算该簇允许的特征数量（至少 1 个，且不超过 max_per_cluster）
-        omega_cluster = min(max(1, int(cluster_size * omega)), max_per_cluster)
+        
+        if cluster_quotas is not None:
+            # 使用质量加权配额（允许为 0）
+            omega_cluster = min(cluster_quotas[i], max_per_cluster)
+        else:
+            # 使用传统 omega 比例（强制至少 1 个）
+            omega_cluster = min(max(1, int(cluster_size * omega)), max_per_cluster)
 
         # 找出该簇中当前被选中的特征列表
-        selected_features = [i for i in cluster if repaired_chromosome[i] == 1]
+        selected_features = [f for f in cluster if repaired_chromosome[f] == 1]
 
         # 如果选中的特征数量 > omega_cluster，需要移除一些
         if len(selected_features) > omega_cluster:
@@ -224,7 +377,7 @@ def roulette_wheel_selection(population, fitness_values, select_count):
     return selected_population, selected_fitness
 
 # 交叉变异过程：生成新种群
-def perform_crossover_mutation(population, clusters, omega, num_features, normalized_fisher_scores):
+def perform_crossover_mutation(population, clusters, omega, num_features, normalized_fisher_scores, cluster_quotas=None):
     new_population = []
     for i in range(0, len(population), 2):  # 每次取两条染色体进行交叉
         parent1 = population[i]
@@ -236,9 +389,9 @@ def perform_crossover_mutation(population, clusters, omega, num_features, normal
         child1 = mutation(child1, i, mutation_rate=0.05)  # 传入染色体序号 i
         child2 = mutation(child2, i+1, mutation_rate=0.05)  # 传入染色体序号 i+1
 
-        # 修复操作
-        child1 = repair(child1, clusters, omega, normalized_fisher_scores)
-        child2 = repair(child2, clusters, omega, normalized_fisher_scores)
+        # 修复操作（传递配额）
+        child1 = repair(child1, clusters, omega, normalized_fisher_scores, cluster_quotas=cluster_quotas)
+        child2 = repair(child2, clusters, omega, normalized_fisher_scores, cluster_quotas=cluster_quotas)
 
         new_population.extend([child1, child2])
 
@@ -246,9 +399,12 @@ def perform_crossover_mutation(population, clusters, omega, num_features, normal
 
 # 主遗传算法流程
 def genetic_algorithm(population, fitness_values, X_train, y_train, clusters, omega, similarity_matrix, population_size, 
-                      num_features, normalized_fisher_scores):
+                      num_features, normalized_fisher_scores, cluster_quotas=None):
     """
     遗传算法主函数
+    
+    Args:
+        cluster_quotas: 每个簇的配额列表（如果提供，则使用质量加权分配）
     """
     generations = 100  # 最大迭代代数
     # set_random_seed(42)
@@ -256,7 +412,10 @@ def genetic_algorithm(population, fitness_values, X_train, y_train, clusters, om
     for generation in range(generations):
         
         # Step 2: 进行交叉、变异和修复，生成新种群
-        new_population = perform_crossover_mutation(population, clusters, omega, num_features, normalized_fisher_scores)
+        new_population = perform_crossover_mutation(
+            population, clusters, omega, num_features, normalized_fisher_scores,
+            cluster_quotas=cluster_quotas
+        )
         
         # Step 3: 计算新种群的适应度值
         new_fitness_values = calculate_fitness(new_population, X_train, y_train, similarity_matrix, n_jobs=10)
@@ -275,6 +434,6 @@ def genetic_algorithm(population, fitness_values, X_train, y_train, clusters, om
         fitness_values = selected_fitness
 
         # 输出当前代的最佳适应度
-        print(f"Best fitness value in generation {generation + 1}: {max(selected_fitness)}")
+        # print(f"Best fitness value in generation {generation + 1}: {max(selected_fitness)}")
 
     return population, fitness_values

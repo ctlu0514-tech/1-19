@@ -13,7 +13,7 @@ from final_subset_selection import final_subset_selection
 from genetic_algorithm_utils import set_random_seed
 
 
-def semantic_pre_clustering(feature_names, max_cluster_size=200):
+def semantic_pre_clustering(feature_names):
     """
     根据特征命名的语义结构进行预聚类。
     支持多种命名格式:
@@ -30,36 +30,50 @@ def semantic_pre_clustering(feature_names, max_cluster_size=200):
     """
     clusters = defaultdict(list)
     
+    import re
+    # 辅助函数：简化滤波器名称 (去除参数如 -2-0-mm-3D)
+    def simplify_filter_name(filter_part):
+        # 1. log-sigma-xxx -> log-sigma
+        if filter_part.startswith("log-sigma"):
+            return "log-sigma"
+        # 2. lbp-xd-xxx -> lbp
+        if filter_part.startswith("lbp"):
+            return "lbp"
+        # 3. wavelet-xxx -> wavelet (可选：wavelet 不同子带其实差异较大，可视情况决定是否合并)
+        # 这里为了保持一定区分度，暂时不合并 wavelet 的子带（LLH, HHL等），只合并 log-sigma 和 lbp
+        # 如果用户希望能更加激进地合并，可以把 wavelet-xxx 也简化为 wavelet
+        return filter_part
+
     for i, name in enumerate(feature_names):
         parts = name.split('_')
         if len(parts) >= 2:
-            # 使用 前缀_滤波器 作为聚类键
-            key = f"{parts[0]}_{parts[1]}"
+            # 原始提取：前缀_滤波器
+            prefix = parts[0]
+            raw_filter = parts[1]
+            
+            # 简化滤波器名称，实现归并
+            simple_filter = simplify_filter_name(raw_filter)
+            
+            key = f"{prefix}_{simple_filter}"
         else:
             key = parts[0] if parts else "unknown"
         clusters[key].append(i)
     
-    # 如果某个组过大，进一步按特征类型细分
+    # 直接使用聚类结果，不再细分
     result = []
+    result_names = []
     for key, indices in clusters.items():
-        if len(indices) > max_cluster_size:
-            # 细分：按第三部分（通常是特征类别如 glcm, glrlm）
-            sub_clusters = defaultdict(list)
-            for idx in indices:
-                parts = feature_names[idx].split('_')
-                sub_key = parts[2] if len(parts) >= 3 else 'other'
-                sub_clusters[sub_key].append(idx)
-            result.extend(sub_clusters.values())
-        else:
-            result.append(indices)
+        result.append(indices)
+        result_names.append(key)
     
-    return result
+    return result, result_names
 
 
 def cdgafs_feature_selection(X, y, feature_list, theta, omega, population_size,
-                              use_semantic_clustering=False, max_cluster_size=200,
+                              use_semantic_clustering=False,
                               use_quality_quota=False, target_k=50, 
-                              top_cluster_ratio=0.5, temperature=10.0):
+                              top_cluster_ratio=0.5, temperature=10.0,
+                              cv_folds=3, stability_repeats=1, stability_fraction=0.8, stability_seed=42):
     """
     执行特征选择流程（建图、社团检测/语义聚类、GA）。
 
@@ -76,6 +90,11 @@ def cdgafs_feature_selection(X, y, feature_list, theta, omega, population_size,
         target_k (int): 目标选择特征数（仅在 use_quality_quota=True 时使用）
         top_cluster_ratio (float): 筛选的高质量社区比例（如0.5表示选Top 50%）
         temperature (float): Softmax 温度参数，越大权重差异越大
+        fitness_mode (str): 适应度模式 (knn/relevance/hybrid)
+        den_lambda (float): 冗余因子权重 (hybrid模式用)
+        cv_folds (int): 交叉验证折数
+        cv_weight (float): 混合模式权重
+        stability_repeats/fraction/seed: 稳定性参数
         
     返回: (元组)
         selected_original_indices (list): GA选出的最终特征索引
@@ -98,13 +117,16 @@ def cdgafs_feature_selection(X, y, feature_list, theta, omega, population_size,
     fisher_scores_subset = fisher_scores
     feature_list_subset = feature_list
     
+    print(f"Raw Fisher Scores: min={fisher_scores.min():.6f}, max={fisher_scores.max():.6f}, mean={fisher_scores.mean():.6f}")
+
     normalized_fisher_scores = normalize_scores(fisher_scores_subset)
     print("归一化后的 Fisher Scores (前5个):", normalized_fisher_scores[:5]) 
 
     # Step 2 & 3: 聚类（语义聚类或ISCD）
+    cluster_names = []
     if use_semantic_clustering:
-        print(f"\nStep 2: 使用语义预聚类 (max_cluster_size={max_cluster_size})...")
-        clusters = semantic_pre_clustering(feature_list_subset, max_cluster_size)
+        print(f"\nStep 2: 使用语义预聚类...")
+        clusters, cluster_names = semantic_pre_clustering(feature_list_subset)
         print(f"语义聚类完成，共 {len(clusters)} 个聚类。")
         
         # 打印聚类分布
@@ -129,6 +151,8 @@ def cdgafs_feature_selection(X, y, feature_list, theta, omega, population_size,
         for node, community in partition.items():
             clusters[community].append(node)
         clusters = [cluster for cluster in clusters.values()]
+        # 为 ISCD 生成简单的社区名称
+        cluster_names = [f"ISCD_Comm_{i}" for i in range(len(clusters))]
         print(f"检测到 {len(clusters)} 个社区。")
     
     # Step 4: 初始化种群并执行遗传算法
@@ -140,8 +164,9 @@ def cdgafs_feature_selection(X, y, feature_list, theta, omega, population_size,
     if use_quality_quota:
         print(f"  [方案C质量加权配额] target_k={target_k}, top_ratio={top_cluster_ratio}, temp={temperature}")
         cluster_quotas = allocate_quota_by_quality(
-            clusters, fisher_scores_subset, target_k, 
-            top_cluster_ratio=top_cluster_ratio, temperature=temperature
+            clusters, normalized_fisher_scores, target_k, 
+            top_cluster_ratio=top_cluster_ratio, temperature=temperature,
+            cluster_names=cluster_names, similarity_matrix=similarity_matrix
         )
     
     population = initialize_population(
@@ -154,13 +179,14 @@ def cdgafs_feature_selection(X, y, feature_list, theta, omega, population_size,
     avg_features = np.mean([np.sum(c) for c in population])
     print(f"初始种群平均特征数: {avg_features:.1f}")
     
-    fitness_values = calculate_fitness(population, X_subset, y, similarity_matrix, n_jobs=10)
+    fitness_values, ca_values, den_values = calculate_fitness(population, X_subset, y, similarity_matrix, n_jobs=10)
     print(f"初始适应度值示例: {fitness_values[:5]}")
 
     population, fitness_values = genetic_algorithm(
         population, fitness_values, X_subset, y, clusters, omega, 
         similarity_matrix, population_size, num_features_subset, normalized_fisher_scores,
-        cluster_quotas=cluster_quotas
+        cluster_quotas=cluster_quotas, ca_values=ca_values, den_values=den_values,
+        cv_folds=cv_folds, stability_repeats=stability_repeats, stability_fraction=stability_fraction, stability_seed=stability_seed
     )
     
     # Step 5: 选择最终特征子集

@@ -323,6 +323,10 @@ def run_feature_selection(
     use_quality_quota: bool = False,
     top_cluster_ratio: float = 0.5,
     temperature: float = 10.0,
+    cdgafs_cv_folds: int = 3,
+    cdgafs_stability_repeats: int = 1,
+    cdgafs_stability_fraction: float = 0.8,
+    cdgafs_stability_seed: int = 42,
 ) -> np.ndarray:
     method = method.upper()
     start_t = time.time()
@@ -382,9 +386,13 @@ def run_feature_selection(
             sel_idx, *_ = cdgafs_feature_selection(
                 X=X_train, y=y_train, feature_list=feature_names,
                 theta=cdgafs_theta, omega=cdgafs_omega, population_size=cdgafs_pop,
-                use_semantic_clustering=use_semantic, max_cluster_size=max_cluster_size,
+                use_semantic_clustering=use_semantic,
                 use_quality_quota=use_quality_quota, target_k=K, 
-                top_cluster_ratio=top_cluster_ratio, temperature=temperature
+                top_cluster_ratio=top_cluster_ratio, temperature=temperature,
+                cv_folds=cdgafs_cv_folds,
+                stability_repeats=cdgafs_stability_repeats,
+                stability_fraction=cdgafs_stability_fraction,
+                stability_seed=cdgafs_stability_seed,
             )
             selected_idx = list(sel_idx) if sel_idx is not None else []
             if len(selected_idx) > K:
@@ -496,14 +504,13 @@ CONFIG = {
     "rfe_step": 1,
 
     # CDGAFS 超参（仅在安装了 CDGAFS 且 methods 包含 CDGAFS 时生效）
-    "cdgafs_pop": 100,
+    "cdgafs_pop": 200,
     "cdgafs_theta": 0.9,
     "cdgafs_omega": 0.05,
     "use_semantic": True,       # 是否使用语义预聚类替代 ISCD
-    "max_cluster_size": 200,     # 语义聚类单组最大特征数
-    "max_per_cluster": 50,       # 每个社区选择的最大特征数
+
     "use_quality_quota": True,   # 是否使用方案C质量加权配额分配
-    "top_cluster_ratio": 0.5,    # 筛选的高质量社区比例 (Top N%)
+    "top_cluster_ratio": 0.2,    # 筛选的高质量社区比例 (Top N%)
     "temperature": 10.0,         # Softmax 温度参数，越大权重差异越大
 
     # 输出 CSV（相对路径：保存到当前工作目录）
@@ -524,10 +531,7 @@ def main():
     parser.add_argument("--out", type=str, default=CONFIG["out"], help="Output CSV file path")
     parser.add_argument("--use_semantic", type=str, default=str(CONFIG["use_semantic"]),
                         help="Use semantic pre-clustering ('True' or 'False')")
-    parser.add_argument("--max_cluster_size", type=int, default=CONFIG["max_cluster_size"],
-                        help="Max features per semantic cluster before sub-division")
-    parser.add_argument("--max_per_cluster", type=int, default=CONFIG["max_per_cluster"],
-                        help="Max features to select from each cluster")
+
     parser.add_argument("--cdgafs_omega", type=float, default=CONFIG["cdgafs_omega"],
                         help="CDGAFS omega parameter (proportion of features per cluster)")
     parser.add_argument("--use_quality_quota", type=str, default=str(CONFIG["use_quality_quota"]),
@@ -536,6 +540,14 @@ def main():
                         help="Top cluster ratio for Plan C (e.g., 0.5 for Top 50%%)")
     parser.add_argument("--temperature", type=float, default=CONFIG["temperature"],
                         help="Softmax temperature for weighted sampling (higher = more contrast)")
+    parser.add_argument("--cdgafs_cv_folds", type=int, default=CONFIG.get("cdgafs_cv_folds", 3),
+                        help="CV folds for KNN fitness (knn mode only)")
+    parser.add_argument("--cdgafs_stability_repeats", type=int, default=CONFIG.get("cdgafs_stability_repeats", 1),
+                        help="Stability repeats for Fisher Score")
+    parser.add_argument("--cdgafs_stability_fraction", type=float, default=CONFIG.get("cdgafs_stability_fraction", 0.8),
+                        help="Sample fraction for stability Fisher Score")
+    parser.add_argument("--cdgafs_stability_seed", type=int, default=CONFIG.get("cdgafs_stability_seed", 42),
+                        help="Random seed for stability sampling")
     args = parser.parse_args()
 
     cfg = dict(CONFIG)  # shallow copy, safe to edit locally
@@ -555,12 +567,17 @@ def main():
     
     # Parse boolean
     cfg['use_semantic'] = (str(args.use_semantic).lower() == 'true')
-    cfg['max_cluster_size'] = args.max_cluster_size
-    cfg['max_per_cluster'] = args.max_per_cluster
+
     cfg['cdgafs_omega'] = args.cdgafs_omega
     cfg['use_quality_quota'] = (str(args.use_quality_quota).lower() == 'true')
     cfg['top_cluster_ratio'] = args.top_cluster_ratio
     cfg['temperature'] = args.temperature
+
+    # Parse fitness params
+    cfg['cdgafs_cv_folds'] = args.cdgafs_cv_folds
+    cfg['cdgafs_stability_repeats'] = args.cdgafs_stability_repeats
+    cfg['cdgafs_stability_fraction'] = args.cdgafs_stability_fraction
+    cfg['cdgafs_stability_seed'] = args.cdgafs_stability_seed
 
     # Normalize lists
     train_centers = None
@@ -589,7 +606,19 @@ def main():
     print(f"Validation start | mode={resolved_mode} | K={cfg['k']} | omega={cfg['cdgafs_omega']} | methods={methods}")
     print("=" * 72)
 
+    # ... (feature selection loop) ...
+
+    # [修改] 导入新写的评估函数
+    # 假设 evaluation.py 在同级目录
+    try:
+        from evaluation import evaluate_multiple_models
+    except ImportError:
+        # Fallback if import fails (e.g. file not found), define a dummy or raise
+        print("[Error] Could not import evaluation.evaluate_multiple_models. Please ensure evaluation.py is present.")
+        return
+
     summary_rows = []
+    
     for method in methods:
         sel_idx = run_feature_selection(
             X_train=X_train,
@@ -602,37 +631,82 @@ def main():
             cdgafs_theta=cfg['cdgafs_theta'],
             cdgafs_omega=cfg['cdgafs_omega'],
             use_semantic=cfg['use_semantic'],
-            max_cluster_size=cfg['max_cluster_size'],
             use_quality_quota=cfg['use_quality_quota'],
             top_cluster_ratio=cfg['top_cluster_ratio'],
             temperature=cfg['temperature'],
+            cdgafs_cv_folds=cfg['cdgafs_cv_folds'],
+            cdgafs_stability_repeats=cfg['cdgafs_stability_repeats'],
+            cdgafs_stability_fraction=cfg['cdgafs_stability_fraction'],
+            cdgafs_stability_seed=cfg['cdgafs_stability_seed'],
         )
 
         selected_names = [feature_names[i] for i in sel_idx]
-        # print(f"  Features({len(selected_names)}): {selected_names}")
+        print(f"  Features({len(selected_names)}): {selected_names}")
 
-        scores = evaluate_model(datasets, sel_idx)
+        # [修改] 调用多模型评估
+        # multi_scores 结构: { 'LR': {'Train': {...}, 'IntVal': {...}}, 'RF': ... }
+        multi_scores = evaluate_multiple_models(datasets, sel_idx)
 
-        row = {"Method": method.upper(), "Features": len(sel_idx), "Selected": "|".join(selected_names)}
-        for ds_name, res in scores.items():
-            row[f"{ds_name}_AUC"] = res["AUC"]
-            row[f"{ds_name}_ACC"] = res["ACC"]
-            row[f"{ds_name}_Sens"] = res["Sens"]
-            row[f"{ds_name}_Spec"] = res["Spec"]
-        summary_rows.append(row)
+        print(f"\n--- [Method: {method}] Evaluation Results ---")
+        
+        # 遍历每个分类器模型
+        for clf_name, dataset_scores in multi_scores.items():
+            # 构造 CSV 行
+            row = {
+                "FS_Method": method.upper(),
+                "Classifier": clf_name,
+                "Features_Count": len(sel_idx),
+                "Selected_Features": "|".join(selected_names)
+            }
+            
+            # 扁平化指标到行
+            for ds_name, metrics in dataset_scores.items():
+                row[f"{ds_name}_AUC"] = metrics["AUC"]
+                row[f"{ds_name}_ACC"] = metrics["ACC"]
+                row[f"{ds_name}_Sens"] = metrics["Sens"]
+                row[f"{ds_name}_Spec"] = metrics["Spec"]
+            
+            summary_rows.append(row)
 
-        # Print compact table
-        header = f"{'Dataset':<18} | {'AUC':<8} | {'ACC':<8} | {'Sens':<8} | {'Spec':<8}"
-        print("\n" + header)
-        print("-" * len(header))
-        for ds_name, res in scores.items():
-            print(f"{ds_name:<18} | {res['AUC']:<8.4f} | {res['ACC']:<8.4f} | {res['Sens']:<8.4f} | {res['Spec']:<8.4f}")
-        print("-" * len(header))
+            # --- 打印该分类器的核心验证集结果 (IntVal) ---
+            # 如果是多中心模式，可以根据需要打印 Ext_* 
+            # 这里简单打印 Train 和 IntVal
+            
+            # Header only once per FS method or for each? Let's do a mini table per classifier
+            if clf_name == 'LR': # Print header for the first model
+                 header = f"{'Model':<6} | {'Dataset':<10} | {'AUC':<8} | {'ACC':<8} | {'Sens':<8} | {'Spec':<8}"
+                 print(header)
+                 print("-" * len(header))
+            
+            for ds_name in ["Train", "IntVal"]:
+                if ds_name in dataset_scores:
+                    res = dataset_scores[ds_name]
+                    print(f"{clf_name:<6} | {ds_name:<10} | {res['AUC']:<8.4f} | {res['ACC']:<8.4f} | {res['Sens']:<8.4f} | {res['Spec']:<8.4f}")
+            # print("-" * 40)
+
+        print("="*60)
 
     out_path = cfg['out']
-    pd.DataFrame(summary_rows).to_csv(out_path, index=False)
-    print(f"\nDone. Saved to: {out_path}")
+    # 重新排序列以保证美观
+    df_out = pd.DataFrame(summary_rows)
+    
+    # 简单的列排序逻辑：FS_Method, Classifier, 接着是指标，最后是 Features
+    cols = list(df_out.columns)
+    first_cols = ["FS_Method", "Classifier", "Features_Count"]
+    last_cols = ["Selected_Features"]
+    mid_cols = [c for c in cols if c not in first_cols and c not in last_cols]
+    # 对 mid_cols 排序 (Train_AUC, Train_ACC, IntVal_AUC...)
+    mid_cols.sort() 
+    
+    final_cols = first_cols + mid_cols + last_cols
+    # 确保列都存在
+    final_cols = [c for c in final_cols if c in df_out.columns]
+    
+    df_out = df_out[final_cols]
+    df_out.to_csv(out_path, index=False)
+    print(f"\nDone. Extended validation summary saved to: {out_path}")
 
 
 if __name__ == "__main__":
     main()
+

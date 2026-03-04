@@ -28,27 +28,38 @@ def calculate_fitness(chromosomes, X, y, similarity_matrix, n_jobs=-1, cv_folds=
         else:
             denominator = 0.0
             
-        # 2. 计算 Performance (CA) - RF CV AUC
-        # 使用 AUC 替代 Accuracy，更适合非平衡数据，且更能反映模型排序能力。
+        # 2. 计算 Performance (CA)
+        # 开关控制：
+        # 'knn' - 快速，距离敏感，适合早期探索
+        # 'rf'  - 较慢，非线性强，适合寻找复杂交互特征
+        classifier_type = 'knn'  # 可选: 'knn', 'rf'
+        
         X_sub = X[:, selected_features]
-        # knn = KNeighborsClassifier(n_neighbors=5)
-        # 既然最后关注 RF/LR 等，这里用 RF 能兼顾非线性和集成优势，
-        from sklearn.ensemble import RandomForestClassifier
-        from sklearn.model_selection import StratifiedKFold, cross_val_score
-        
-        clf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1)
-        
         cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        
         try:
-            # scoring='roc_auc' 计算 AUC
-            cv_scores = cross_val_score(clf, X_sub, y, cv=cv, scoring='roc_auc')
-            ca = cv_scores.mean()
+            if classifier_type == 'knn':
+                from sklearn.neighbors import KNeighborsClassifier
+                clf = KNeighborsClassifier(n_neighbors=5)
+                # KNN 改用 roc_auc 评估
+                cv_scores = cross_val_score(clf, X_sub, y, cv=cv, scoring='roc_auc')
+                ca = cv_scores.mean()
+                
+            elif classifier_type == 'rf':
+                from sklearn.ensemble import RandomForestClassifier
+                clf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1)
+                # RF 用 ROC_AUC 评估更准
+                cv_scores = cross_val_score(clf, X_sub, y, cv=cv, scoring='roc_auc')
+                ca = cv_scores.mean()
+                
+            else: 
+                ca = 0.5
+                
         except Exception:
-            ca = 0.5 # AUC 的基线是 0.5
+            ca = 0.5 if classifier_type == 'rf' else 0.0
         
         # 3. 计算 Final Fitness
-        # 公式: Fitness = AUC / Den (或者 AUC - alpha * Den)
-        # 这里先改回除法，让你看下 AUC 的效果
+        # 公式: Fitness = CA / Den
         fitness = ca / (denominator + 1e-9)
             
         return (fitness, ca, denominator)

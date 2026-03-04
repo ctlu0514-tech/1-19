@@ -9,7 +9,7 @@ def set_random_seed(seed: int):
 
 
 def allocate_quota_by_quality(clusters, fisher_scores, total_k, 
-                               top_cluster_ratio=0.5, temperature=10.0,
+                               top_cluster_ratio, temperature=10.0,
                                cluster_names=None, similarity_matrix=None):
     """
     方案C: 两阶段配额分配（筛选 + 加权采样）
@@ -99,8 +99,9 @@ def allocate_quota_by_quality(clusters, fisher_scores, total_k,
           f"max={cluster_quality_scores.max():.6f}, mean={cluster_quality_scores.mean():.6f}")
     
     # ========== 阶段1: 筛选高质量社区 ==========
-    # 计算需要激活的社区数（至少等于 total_k，确保有足够的社区）
-    n_active = max(total_k, int(n_clusters * top_cluster_ratio))
+    # 计算需要激活的社区数
+    # 改为至少选1个
+    n_active = max(1, int(n_clusters * top_cluster_ratio))
     n_active = min(n_active, n_clusters)  # 不能超过总社区数
     
     # 按质量排序，选择 Top N 个社区

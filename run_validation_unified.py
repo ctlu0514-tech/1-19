@@ -30,7 +30,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
@@ -187,12 +187,9 @@ def load_and_split(
     datasets: Dict[str, Tuple[pd.DataFrame, np.ndarray]] = {}
 
     if resolved_mode == "single":
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_all, y_all, test_size=val_size, random_state=random_state, stratify=y_all
-        )
-        datasets["Train"] = (X_train, y_train)
-        datasets["IntVal"] = (X_val, y_val)
-        print(f"[Split] 模式=单中心(single) | 总数={len(df)} | 训练集={len(X_train)} | 内部验证集={len(X_val)}")
+        # 五折交叉验证模式：不做 train_test_split，返回全量数据
+        datasets["All"] = (X_all, y_all)
+        print(f"[Split] 模式=单中心(single, 5-Fold CV) | 总数={len(df)}")
     else:
         # multi-center
         if center_col is None or center_col not in df.columns:
@@ -256,20 +253,31 @@ def preprocess_securely(
       - Standardize on Train
     """
     X_train_df, y_train = datasets["Train"]
+    
+    initial_feat_count = X_train_df.shape[1]
+    print(f"[数据预处理] 初始特征数: {initial_feat_count}")
 
-    # Defensive: drop columns that are all-NaN in the TRAIN split
+    # 1. Drop columns that are all-NaN in the TRAIN split
     all_missing_cols = X_train_df.columns[X_train_df.isna().all(axis=0)].tolist()
     if all_missing_cols:
-        print(f"[Preprocess] Dropping all-missing-in-train columns: {all_missing_cols}")
+        count_missing = len(all_missing_cols)
+        print(f"[数据预处理]  -> 剔除了 {count_missing} 个全为空(NaN)的列. (示例: {all_missing_cols[:3]}...)")
         for name in list(datasets.keys()):
             X_df, y = datasets[name]
             datasets[name] = (X_df.drop(columns=all_missing_cols), y)
         X_train_df, y_train = datasets["Train"]
+    else:
+        print("[数据预处理]  -> 未发现全为空(NaN)的列。")
 
     # Ensure numeric dtype (should already be numeric after load_and_split coercion)
     non_numeric = [c for c in X_train_df.columns if not pd.api.types.is_numeric_dtype(X_train_df[c])]
     if non_numeric:
         raise ValueError(f"Non-numeric feature columns remain after coercion: {non_numeric}. Please drop them.")
+
+    # 2. Impute (Mean)
+    # 统计有多少列包含 NaN (将被填充)
+    cols_with_nan = X_train_df.columns[X_train_df.isna().any()].tolist()
+    print(f"[数据预处理]  -> 正在对 {len(cols_with_nan)} 个含有 NaN 的特征列进行均值填充。")
 
     imputer = SimpleImputer(strategy="mean")
     scaler = StandardScaler()
@@ -277,13 +285,22 @@ def preprocess_securely(
     imputer.fit(X_train_df)
     X_train_imp = imputer.transform(X_train_df)
 
-    # Variance filter fit on Train only
+    # 3. Variance Filter
     vars_ = np.var(X_train_imp, axis=0)
     good_idx = np.where(vars_ > var_threshold)[0]
+    
+    dropped_var_count = X_train_imp.shape[1] - len(good_idx)
+    if dropped_var_count > 0:
+        print(f"[数据预处理]  -> 剔除了 {dropped_var_count} 个低方差特征 (阈值={var_threshold})。")
+    else:
+        print(f"[数据预处理]  -> 没有特征因低方差被剔除。")
+
     if len(good_idx) == 0:
         raise ValueError("All features are constant (or below variance threshold) on training set.")
 
     X_train_f = X_train_imp[:, good_idx]
+    
+    # 4. Standardize
     scaler.fit(X_train_f)
 
     processed: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
@@ -302,7 +319,7 @@ def preprocess_securely(
     if bad:
         raise RuntimeError(f"Label leakage detected in final feature list: {bad}")
 
-    print(f"[Preprocess] kept_features={len(final_features)} (removed {len(all_cols)-len(final_features)})")
+    print(f"[数据预处理] 最终保留特征: {len(final_features)} (总计剔除: {initial_feat_count - len(final_features)})")
     return processed, final_features
 
 # ============================================================
@@ -476,7 +493,7 @@ def evaluate_model(
 
 CONFIG = {
     # 数据路径（支持 .csv 或 .gz 的 gzip 压缩 CSV）
-    "csv": "/data/qh_20T_share_file/lct/CT67/localdata/prostate_features_with_label.csv",
+    "csv": "/data/qh_20T_share_file/lct/CT67/localdata/old_prostate_features_with_label.csv",
 
     # 列名
     "label": "label",
@@ -499,18 +516,18 @@ CONFIG = {
 
     # 方法与超参
     "methods": "CDGAFS,LASSO,MRMR",
-    "k": 50,
+    "k": 100,
     "var_threshold": 1e-10,
     "rfe_step": 1,
 
     # CDGAFS 超参（仅在安装了 CDGAFS 且 methods 包含 CDGAFS 时生效）
     "cdgafs_pop": 200,
     "cdgafs_theta": 0.9,
-    "cdgafs_omega": 0.05,
-    "use_semantic": True,       # 是否使用语义预聚类替代 ISCD
+    "cdgafs_omega": 0.5,
+    "use_semantic": False,       # 是否使用语义预聚类替代 ISCD
 
     "use_quality_quota": True,   # 是否使用方案C质量加权配额分配
-    "top_cluster_ratio": 0.2,    # 筛选的高质量社区比例 (Top N%)
+    "top_cluster_ratio": 0.5,    # 筛选的高质量社区比例 (Top N%)
     "temperature": 10.0,         # Softmax 温度参数，越大权重差异越大
 
     # 输出 CSV（相对路径：保存到当前工作目录）
@@ -598,113 +615,222 @@ def main():
         random_state=cfg['seed'],
     )
 
-    # Preprocess
-    datasets, feature_names = preprocess_securely(datasets_raw, var_threshold=cfg['var_threshold'])
-    X_train, y_train = datasets["Train"]
+    # 导入评估函数
+    try:
+        from evaluation import evaluate_multiple_models, evaluate_single_fold
+    except ImportError:
+        print("[Error] Could not import evaluation module. Please ensure evaluation.py is present.")
+        return
 
     print("=" * 72)
     print(f"Validation start | mode={resolved_mode} | K={cfg['k']} | omega={cfg['cdgafs_omega']} | methods={methods}")
     print("=" * 72)
 
-    # ... (feature selection loop) ...
+    # ================================================================
+    # 单中心模式：五折交叉验证（方案 2 — 严格无泄漏）
+    # ================================================================
+    if resolved_mode == "single":
+        X_all_df, y_all = datasets_raw["All"]
+        n_folds = 5
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=cfg['seed'])
 
-    # [修改] 导入新写的评估函数
-    # 假设 evaluation.py 在同级目录
-    try:
-        from evaluation import evaluate_multiple_models
-    except ImportError:
-        # Fallback if import fails (e.g. file not found), define a dummy or raise
-        print("[Error] Could not import evaluation.evaluate_multiple_models. Please ensure evaluation.py is present.")
-        return
+        # 收集结果：{ (method, clf_name) : [ {AUC, ACC, Sens, Spec}, ... ] }  每个元素是一折的指标
+        from collections import defaultdict
+        fold_metrics = defaultdict(list)  # key = (method, clf_name)
+        fold_features = defaultdict(list)  # key = method -> list of feature-name lists per fold
 
-    summary_rows = []
-    
-    for method in methods:
-        sel_idx = run_feature_selection(
-            X_train=X_train,
-            y_train=y_train,
-            feature_names=feature_names,
-            method=method,
-            K=cfg['k'],
-            rfe_step=cfg['rfe_step'],
-            cdgafs_pop=cfg['cdgafs_pop'],
-            cdgafs_theta=cfg['cdgafs_theta'],
-            cdgafs_omega=cfg['cdgafs_omega'],
-            use_semantic=cfg['use_semantic'],
-            use_quality_quota=cfg['use_quality_quota'],
-            top_cluster_ratio=cfg['top_cluster_ratio'],
-            temperature=cfg['temperature'],
-            cdgafs_cv_folds=cfg['cdgafs_cv_folds'],
-            cdgafs_stability_repeats=cfg['cdgafs_stability_repeats'],
-            cdgafs_stability_fraction=cfg['cdgafs_stability_fraction'],
-            cdgafs_stability_seed=cfg['cdgafs_stability_seed'],
-        )
+        for fold_i, (train_idx, test_idx) in enumerate(skf.split(X_all_df, y_all), start=1):
+            print(f"\n{'='*72}")
+            print(f"===  Fold {fold_i}/{n_folds}  ===")
+            print(f"{'='*72}")
 
-        selected_names = [feature_names[i] for i in sel_idx]
-        print(f"  Features({len(selected_names)}): {selected_names}")
+            # --- a. 按 fold 划分 ---
+            X_train_df = X_all_df.iloc[train_idx].copy()
+            y_train = y_all[train_idx]
+            X_test_df = X_all_df.iloc[test_idx].copy()
+            y_test = y_all[test_idx]
 
-        # [修改] 调用多模型评估
-        # multi_scores 结构: { 'LR': {'Train': {...}, 'IntVal': {...}}, 'RF': ... }
-        multi_scores = evaluate_multiple_models(datasets, sel_idx)
+            print(f"[Fold {fold_i}] 训练集={len(X_train_df)}, 测试集={len(X_test_df)}")
 
-        print(f"\n--- [Method: {method}] Evaluation Results ---")
-        
-        # 遍历每个分类器模型
-        for clf_name, dataset_scores in multi_scores.items():
-            # 构造 CSV 行
-            row = {
-                "FS_Method": method.upper(),
-                "Classifier": clf_name,
-                "Features_Count": len(sel_idx),
-                "Selected_Features": "|".join(selected_names)
+            # --- b. 预处理 (fit on train_fold only) ---
+            fold_datasets_raw = {
+                "Train": (X_train_df, y_train),
+                "Test": (X_test_df, y_test),
             }
-            
-            # 扁平化指标到行
-            for ds_name, metrics in dataset_scores.items():
-                row[f"{ds_name}_AUC"] = metrics["AUC"]
-                row[f"{ds_name}_ACC"] = metrics["ACC"]
-                row[f"{ds_name}_Sens"] = metrics["Sens"]
-                row[f"{ds_name}_Spec"] = metrics["Spec"]
-            
-            summary_rows.append(row)
+            fold_datasets, fold_feature_names = preprocess_securely(
+                fold_datasets_raw, var_threshold=cfg['var_threshold']
+            )
+            X_train_proc, y_train_proc = fold_datasets["Train"]
+            X_test_proc, y_test_proc = fold_datasets["Test"]
 
-            # --- 打印该分类器的核心验证集结果 (IntVal) ---
-            # 如果是多中心模式，可以根据需要打印 Ext_* 
-            # 这里简单打印 Train 和 IntVal
-            
-            # Header only once per FS method or for each? Let's do a mini table per classifier
-            if clf_name == 'LR': # Print header for the first model
-                 header = f"{'Model':<6} | {'Dataset':<10} | {'AUC':<8} | {'ACC':<8} | {'Sens':<8} | {'Spec':<8}"
-                 print(header)
-                 print("-" * len(header))
-            
-            for ds_name in ["Train", "IntVal"]:
-                if ds_name in dataset_scores:
-                    res = dataset_scores[ds_name]
-                    print(f"{clf_name:<6} | {ds_name:<10} | {res['AUC']:<8.4f} | {res['ACC']:<8.4f} | {res['Sens']:<8.4f} | {res['Spec']:<8.4f}")
-            # print("-" * 40)
+            # --- c & d & e. 对每种特征筛选方法：筛选 → 评估 ---
+            for method in methods:
+                print(f"\n  --- Fold {fold_i}, Method: {method} ---")
+                sel_idx = run_feature_selection(
+                    X_train=X_train_proc,
+                    y_train=y_train_proc,
+                    feature_names=fold_feature_names,
+                    method=method,
+                    K=cfg['k'],
+                    rfe_step=cfg['rfe_step'],
+                    cdgafs_pop=cfg['cdgafs_pop'],
+                    cdgafs_theta=cfg['cdgafs_theta'],
+                    cdgafs_omega=cfg['cdgafs_omega'],
+                    use_semantic=cfg['use_semantic'],
+                    use_quality_quota=cfg['use_quality_quota'],
+                    top_cluster_ratio=cfg['top_cluster_ratio'],
+                    temperature=cfg['temperature'],
+                    cdgafs_cv_folds=cfg['cdgafs_cv_folds'],
+                    cdgafs_stability_repeats=cfg['cdgafs_stability_repeats'],
+                    cdgafs_stability_fraction=cfg['cdgafs_stability_fraction'],
+                    cdgafs_stability_seed=cfg['cdgafs_stability_seed'],
+                )
 
-        print("="*60)
+                selected_names = [fold_feature_names[i] for i in sel_idx]
+                fold_features[method].append(selected_names)
+                print(f"    Features({len(selected_names)}): {selected_names}")
 
+                # 多模型评估（单折）
+                fold_result = evaluate_single_fold(
+                    X_train_proc, y_train_proc,
+                    X_test_proc, y_test_proc,
+                    sel_idx,
+                )
+
+                for clf_name, metrics in fold_result.items():
+                    fold_metrics[(method, clf_name)].append(metrics)
+                    print(f"    {clf_name}: AUC={metrics['AUC']:.4f}  ACC={metrics['ACC']:.4f}  "
+                          f"Sens={metrics['Sens']:.4f}  Spec={metrics['Spec']:.4f}")
+
+        # --- 汇总 5 折结果 ---
+        print(f"\n\n{'#'*72}")
+        print("### 五折交叉验证最终结果 (mean ± std) ###")
+        print(f"{'#'*72}")
+
+        header = (f"{'FS_Method':<10} | {'Classifier':<6} | {'AUC':<15} | {'ACC':<15} | "
+                  f"{'Sens':<15} | {'Spec':<15}")
+        print(header)
+        print("-" * len(header))
+
+        summary_rows = []
+        for method in methods:
+            for clf_name in ['LR', 'RF', 'SVM', 'XGB', 'NN', 'LNN']:
+                key = (method, clf_name)
+                if key not in fold_metrics:
+                    continue
+                metric_list = fold_metrics[key]
+                auc_vals = [m['AUC'] for m in metric_list]
+                acc_vals = [m['ACC'] for m in metric_list]
+                sens_vals = [m['Sens'] for m in metric_list]
+                spec_vals = [m['Spec'] for m in metric_list]
+
+                auc_mean, auc_std = np.mean(auc_vals), np.std(auc_vals)
+                acc_mean, acc_std = np.mean(acc_vals), np.std(acc_vals)
+                sens_mean, sens_std = np.mean(sens_vals), np.std(sens_vals)
+                spec_mean, spec_std = np.mean(spec_vals), np.std(spec_vals)
+
+                print(f"{method.upper():<10} | {clf_name:<6} | "
+                      f"{auc_mean:.4f}±{auc_std:.4f} | {acc_mean:.4f}±{acc_std:.4f} | "
+                      f"{sens_mean:.4f}±{sens_std:.4f} | {spec_mean:.4f}±{spec_std:.4f}")
+
+                # 收集每折特征（用 | 分隔折，& 分隔特征名）
+                fold_feat_str = " | ".join(
+                    ["&".join(names) for names in fold_features.get(method, [])]
+                )
+
+                summary_rows.append({
+                    "FS_Method": method.upper(),
+                    "Classifier": clf_name,
+                    "Features_Count": cfg['k'],
+                    "CV_AUC_mean": round(auc_mean, 4),
+                    "CV_AUC_std": round(auc_std, 4),
+                    "CV_ACC_mean": round(acc_mean, 4),
+                    "CV_ACC_std": round(acc_std, 4),
+                    "CV_Sens_mean": round(sens_mean, 4),
+                    "CV_Sens_std": round(sens_std, 4),
+                    "CV_Spec_mean": round(spec_mean, 4),
+                    "CV_Spec_std": round(spec_std, 4),
+                    "Fold_Features": fold_feat_str,
+                })
+
+        print(f"{'#'*72}")
+
+    # ================================================================
+    # 多中心模式：保持原有留出法逻辑不变
+    # ================================================================
+    else:
+        # Preprocess (multi-center: fit on Train only)
+        datasets, feature_names = preprocess_securely(datasets_raw, var_threshold=cfg['var_threshold'])
+        X_train, y_train = datasets["Train"]
+
+        summary_rows = []
+        for method in methods:
+            sel_idx = run_feature_selection(
+                X_train=X_train,
+                y_train=y_train,
+                feature_names=feature_names,
+                method=method,
+                K=cfg['k'],
+                rfe_step=cfg['rfe_step'],
+                cdgafs_pop=cfg['cdgafs_pop'],
+                cdgafs_theta=cfg['cdgafs_theta'],
+                cdgafs_omega=cfg['cdgafs_omega'],
+                use_semantic=cfg['use_semantic'],
+                use_quality_quota=cfg['use_quality_quota'],
+                top_cluster_ratio=cfg['top_cluster_ratio'],
+                temperature=cfg['temperature'],
+                cdgafs_cv_folds=cfg['cdgafs_cv_folds'],
+                cdgafs_stability_repeats=cfg['cdgafs_stability_repeats'],
+                cdgafs_stability_fraction=cfg['cdgafs_stability_fraction'],
+                cdgafs_stability_seed=cfg['cdgafs_stability_seed'],
+            )
+
+            selected_names = [feature_names[i] for i in sel_idx]
+            print(f"  Features({len(selected_names)}): {selected_names}")
+
+            multi_scores = evaluate_multiple_models(datasets, sel_idx)
+
+            print(f"\n--- [Method: {method}] Evaluation Results ---")
+            for clf_name, dataset_scores in multi_scores.items():
+                row = {
+                    "FS_Method": method.upper(),
+                    "Classifier": clf_name,
+                    "Features_Count": len(sel_idx),
+                    "Selected_Features": "|".join(selected_names)
+                }
+                for ds_name, metrics in dataset_scores.items():
+                    row[f"{ds_name}_AUC"] = metrics["AUC"]
+                    row[f"{ds_name}_ACC"] = metrics["ACC"]
+                    row[f"{ds_name}_Sens"] = metrics["Sens"]
+                    row[f"{ds_name}_Spec"] = metrics["Spec"]
+                summary_rows.append(row)
+
+                if clf_name == 'LR':
+                    header = f"{'Model':<6} | {'Dataset':<10} | {'AUC':<8} | {'ACC':<8} | {'Sens':<8} | {'Spec':<8}"
+                    print(header)
+                    print("-" * len(header))
+                for ds_name in ["Train", "IntVal"]:
+                    if ds_name in dataset_scores:
+                        res = dataset_scores[ds_name]
+                        print(f"{clf_name:<6} | {ds_name:<10} | {res['AUC']:<8.4f} | {res['ACC']:<8.4f} | {res['Sens']:<8.4f} | {res['Spec']:<8.4f}")
+            print("="*60)
+
+    # --- 输出 CSV ---
     out_path = cfg['out']
-    # 重新排序列以保证美观
     df_out = pd.DataFrame(summary_rows)
-    
-    # 简单的列排序逻辑：FS_Method, Classifier, 接着是指标，最后是 Features
+
     cols = list(df_out.columns)
     first_cols = ["FS_Method", "Classifier", "Features_Count"]
-    last_cols = ["Selected_Features"]
+    last_cols = [c for c in cols if "Features" in c and c not in first_cols]
     mid_cols = [c for c in cols if c not in first_cols and c not in last_cols]
-    # 对 mid_cols 排序 (Train_AUC, Train_ACC, IntVal_AUC...)
-    mid_cols.sort() 
-    
+    mid_cols.sort()
+
     final_cols = first_cols + mid_cols + last_cols
-    # 确保列都存在
     final_cols = [c for c in final_cols if c in df_out.columns]
-    
+
     df_out = df_out[final_cols]
     df_out.to_csv(out_path, index=False)
-    print(f"\nDone. Extended validation summary saved to: {out_path}")
+    print(f"\nDone. Validation summary saved to: {out_path}")
 
 
 if __name__ == "__main__":

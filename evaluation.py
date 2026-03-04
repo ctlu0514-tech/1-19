@@ -184,6 +184,68 @@ class LiquidNeuralNetwork(BaseEstimator, ClassifierMixin):
             exp_d = np.exp(d)
             return exp_d / exp_d.sum(axis=1, keepdims=True)
 
+def _build_model_pool():
+    """返回统一的模型池字典，供 evaluate_single_fold 和 evaluate_multiple_models 共用。"""
+    from sklearn.base import clone as sk_clone
+    return {
+        'LR': LogisticRegressionCV(cv=5, penalty='l2', solver='liblinear', random_state=42, class_weight='balanced', max_iter=1000),
+        'RF': RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced'),
+        'SVM': SVC(probability=True, random_state=42, class_weight='balanced'),
+        'XGB': GradientBoostingClassifier(random_state=42),
+        'NN': MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500, random_state=42),
+        'LNN': LiquidNeuralNetwork(n_hidden=500, random_state=42),
+    }
+
+
+def _compute_metrics(model, X, y_true):
+    """用已训练好的 model 在 (X, y_true) 上计算 AUC/ACC/Sens/Spec。"""
+    y_pred = model.predict(X)
+
+    # 获取概率
+    if hasattr(model, "predict_proba"):
+        try:
+            y_prob = model.predict_proba(X)[:, 1]
+        except Exception:
+            y_prob = model.decision_function(X) if hasattr(model, "decision_function") else y_pred.astype(float)
+    elif hasattr(model, "decision_function"):
+        y_prob = model.decision_function(X)
+    else:
+        y_prob = y_pred.astype(float)
+
+    try:
+        auc = float(roc_auc_score(y_true, y_prob))
+    except Exception:
+        auc = 0.5
+
+    acc = float(accuracy_score(y_true, y_pred))
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    sens = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    spec = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+
+    return {"AUC": auc, "ACC": acc, "Sens": sens, "Spec": spec}
+
+
+def evaluate_single_fold(X_train, y_train, X_test, y_test, selected_idx):
+    """
+    五折交叉验证中单折的多模型评估。
+    在 train 上 fit，在 test 上 predict，返回每个模型的指标。
+
+    Returns:
+        dict: { 'LR': {'AUC':…, 'ACC':…, 'Sens':…, 'Spec':…}, 'RF': … }
+    """
+    X_train_sel = X_train[:, selected_idx]
+    X_test_sel = X_test[:, selected_idx]
+
+    models = _build_model_pool()
+    fold_results = {}
+
+    for model_name, model in models.items():
+        model.fit(X_train_sel, y_train)
+        fold_results[model_name] = _compute_metrics(model, X_test_sel, y_test)
+
+    return fold_results
+
+
 def evaluate_multiple_models(datasets, selected_idx):
     """
     使用选定的特征子集，在多个模型上进行训练和评估。

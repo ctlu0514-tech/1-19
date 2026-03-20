@@ -56,20 +56,17 @@ except Exception:
 # ============================================================
 # Utilities
 # ============================================================
-def binarize_labels(y: np.ndarray) -> np.ndarray:
-    """Robustly map a 2-class label array to {0,1}."""
+def map_labels(y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Map unique labels to 0, 1, 2, ... and return mapping."""
     y = np.asarray(y)
-    # Drop NaN-like; caller should have removed NaN rows already, but keep defensive
     if y.dtype.kind in {"f"}:
         if np.isnan(y).any():
-            raise ValueError("y contains NaN; please drop NaN labels before binarize_labels().")
+            raise ValueError("y contains NaN; please drop NaN labels before mapping.")
 
     uniq = np.unique(y)
-    if len(uniq) != 2:
-        raise ValueError(f"Label must have exactly 2 unique classes; got {uniq}.")
-    # map smaller class label -> 0, larger -> 1 (consistent with 'min->0' approach)
-    lo, hi = uniq[0], uniq[1]
-    return np.where(y == lo, 0, 1).astype(int)
+    mapping = {val: i for i, val in enumerate(np.sort(uniq))}
+    y_mapped = np.array([mapping[val] for val in y], dtype=int)
+    return y_mapped, uniq
 
 
 def infer_feature_columns(df: pd.DataFrame, label_col: str, center_col: Optional[str], id_col: Optional[str]) -> List[str]:
@@ -155,17 +152,16 @@ def load_and_split(
             n_centers = df[center_col].nunique(dropna=True)
             resolved_mode = "multi" if n_centers >= 2 else "single"
 
-    # ---- Global binary label mapping from FULL dataset ----
-    uniq = np.unique(df[label_col].values)
-    if len(uniq) != 2:
-        raise ValueError(f"Label must have exactly 2 unique classes in the full dataset; got {uniq}.")
-    lo, hi = np.sort(uniq)
+    # ---- Global label mapping from FULL dataset ----
+    uniq_classes = np.sort(np.unique(df[label_col].dropna().values))
+    n_classes = len(uniq_classes)
+    label_map = {val: i for i, val in enumerate(uniq_classes)}
 
     def map_y(vals: np.ndarray) -> np.ndarray:
-        vals = np.asarray(vals)
-        return np.where(vals == lo, 0, 1).astype(int)
+        return np.array([label_map[v] for v in vals], dtype=int)
 
     y_all = map_y(df[label_col].values)
+    print(f"[Data] Detected {n_classes} classes: {uniq_classes} mapped to {list(label_map.values())}")
 
     # ---- Infer feature columns (exclude raw label/id/center) ----
     feature_cols = infer_feature_columns(df, label_col=label_col, center_col=center_col, id_col=id_col)
@@ -353,15 +349,23 @@ def run_feature_selection(
         raise ValueError("K must be > 0")
 
     if method == "LASSO":
-        # LogisticRegressionCV supports l1 + liblinear for binary
+        # Use saga solver for L1 + multinomial support
+        n_classes = len(np.unique(y_train))
+        scoring_method = "roc_auc" if n_classes == 2 else "roc_auc_ovr"
+        
         clf = LogisticRegressionCV(
-            cv=5, penalty="l1", solver="liblinear",
-            scoring="roc_auc", class_weight="balanced",
+            cv=5, penalty="l1", solver="saga",
+            scoring=scoring_method, class_weight="balanced",
             random_state=42, max_iter=3000
         )
         clf.fit(X_train, y_train)
-        coefs = np.abs(clf.coef_[0])
-        # Prefer non-zeros; if insufficient, fill by magnitude
+        
+        # For multi-class, coef_ is (n_classes, n_features). Take max absolute value across classes.
+        if n_classes > 2:
+            coefs = np.max(np.abs(clf.coef_), axis=0)
+        else:
+            coefs = np.abs(clf.coef_[0])
+
         nonzero = np.where(coefs > 1e-8)[0]
         if len(nonzero) >= K:
             order = nonzero[np.argsort(coefs[nonzero])[::-1]]
@@ -371,14 +375,12 @@ def run_feature_selection(
             selected_idx = order[:K].tolist()
 
     elif method == "RFE":
-        estimator = LogisticRegression(solver="liblinear", class_weight="balanced", random_state=42)
+        # liblinear is only for binary OvR. Use lbfgs for multi-class multinomial.
+        estimator = LogisticRegression(solver="lbfgs", multi_class="auto", class_weight="balanced", random_state=42, max_iter=1000)
         n_feats = X_train.shape[1]
-        # If user passes integer step via argparse, we keep it; else float proportion for big d
         step_val = rfe_step
         if isinstance(step_val, float) and (step_val <= 0 or step_val >= 1):
-            # fallback to 1 (one by one)
             step_val = 1
-        # If low-dimensional, make it exact
         if n_feats <= 500 and isinstance(step_val, float):
             step_val = 1
         selector = RFE(estimator, n_features_to_select=K, step=step_val)
@@ -414,7 +416,7 @@ def run_feature_selection(
             selected_idx = list(sel_idx) if sel_idx is not None else []
             if len(selected_idx) > K:
                 # prune to K by RFE on the subspace
-                est = LogisticRegression(solver="liblinear", class_weight="balanced", random_state=42)
+                est = LogisticRegression(solver="lbfgs", multi_class="auto", class_weight="balanced", random_state=42, max_iter=1000)
                 rfe = RFE(est, n_features_to_select=K, step=1)
                 rfe.fit(X_train[:, selected_idx], y_train)
                 selected_idx = np.array(selected_idx)[rfe.support_].tolist()
@@ -454,26 +456,46 @@ def evaluate_model(
     X_train, y_train = datasets["Train"]
     X_train_sel = X_train[:, selected_idx]
 
-    clf = LogisticRegression(solver="liblinear", class_weight="balanced", random_state=42)
+    # Use multinomial for multi-class LR
+    clf = LogisticRegression(solver="lbfgs", multi_class="auto", class_weight="balanced", random_state=42, max_iter=2000)
     clf.fit(X_train_sel, y_train)
+
+    n_classes = len(np.unique(y_train))
 
     results: Dict[str, Dict[str, float]] = {}
     for name, (X, y_true) in datasets.items():
         X_sel = X[:, selected_idx]
         y_pred = clf.predict(X_sel)
-        y_prob = clf.predict_proba(X_sel)[:, 1]
+        y_prob = clf.predict_proba(X_sel)
 
         try:
-            auc = float(roc_auc_score(y_true, y_prob))
+            if n_classes == 2:
+                auc = float(roc_auc_score(y_true, y_prob[:, 1]))
+            else:
+                auc = float(roc_auc_score(y_true, y_prob, multi_class='ovr', average='macro'))
         except Exception:
             auc = 0.5
 
         acc = float(accuracy_score(y_true, y_pred))
 
-        # y_true/y_pred are {0,1} by construction; safe confusion matrix
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-        sens = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-        spec = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+        # Sensitivity / Specificity for multi-class (Macro Average)
+        cm = confusion_matrix(y_true, y_pred, labels=range(n_classes))
+        
+        sens_list = []
+        spec_list = []
+        for i in range(n_classes):
+            tp = cm[i, i]
+            fn = np.sum(cm[i, :]) - tp
+            fp = np.sum(cm[:, i]) - tp
+            tn = np.sum(cm) - tp - fn - fp
+            
+            sens_i = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            spec_i = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            sens_list.append(sens_i)
+            spec_list.append(spec_i)
+            
+        sens = float(np.mean(sens_list))
+        spec = float(np.mean(spec_list))
 
         results[name] = {"AUC": auc, "ACC": acc, "Sens": sens, "Spec": spec}
     return results
@@ -493,10 +515,10 @@ def evaluate_model(
 
 CONFIG = {
     # 数据路径（支持 .csv 或 .gz 的 gzip 压缩 CSV）
-    "csv": "/data/qh_20T_share_file/lct/CT67/localdata/old_prostate_features_with_label.csv",
+    "csv": "/data/qh_20T_share_file/lct/CT67/dxq/merged_prostate_data_2class_no_wavelet_No_PET.csv",
 
     # 列名
-    "label": "label",
+    "label": "BCP0.008",
     "id_col": "ID",
 
     # auto / single / multi
@@ -511,19 +533,19 @@ CONFIG = {
     "train_centers": "FuYi",       # 例如 "FuYi,Ningbo"
 
     # 拆分与随机种子
-    "val_size": 0.30,
+    "val_size": 0.20,
     "seed": 42,
 
     # 方法与超参
-    "methods": "CDGAFS,LASSO,MRMR",
-    "k": 100,
+    "methods": "CDGAFS", # ,LASSO,MRMR
+    "k": 80,
     "var_threshold": 1e-10,
-    "rfe_step": 1,
+    "rfe_step": 100,
 
     # CDGAFS 超参（仅在安装了 CDGAFS 且 methods 包含 CDGAFS 时生效）
     "cdgafs_pop": 200,
     "cdgafs_theta": 0.9,
-    "cdgafs_omega": 0.5,
+    "cdgafs_omega": 0.02,
     "use_semantic": False,       # 是否使用语义预聚类替代 ISCD
 
     "use_quality_quota": True,   # 是否使用方案C质量加权配额分配
@@ -636,8 +658,9 @@ def main():
 
         # 收集结果：{ (method, clf_name) : [ {AUC, ACC, Sens, Spec}, ... ] }  每个元素是一折的指标
         from collections import defaultdict
-        fold_metrics = defaultdict(list)  # key = (method, clf_name)
-        fold_features = defaultdict(list)  # key = method -> list of feature-name lists per fold
+        fold_metrics = defaultdict(list)        # key = (method, clf_name), 存放 Test 指标
+        fold_train_metrics = defaultdict(list)  # key = (method, clf_name), 存放 Train 指标
+        fold_features = defaultdict(list)       # key = method -> list of feature-name lists per fold
 
         for fold_i, (train_idx, test_idx) in enumerate(skf.split(X_all_df, y_all), start=1):
             print(f"\n{'='*72}")
@@ -650,7 +673,9 @@ def main():
             X_test_df = X_all_df.iloc[test_idx].copy()
             y_test = y_all[test_idx]
 
-            print(f"[Fold {fold_i}] 训练集={len(X_train_df)}, 测试集={len(X_test_df)}")
+            tr_dist = {f"Class{c}": np.sum(y_train == c) for c in np.unique(y_all)}
+            te_dist = {f"Class{c}": np.sum(y_test == c) for c in np.unique(y_all)}
+            print(f"[Fold {fold_i}] 训练集={len(X_train_df)} ({tr_dist}), 测试集={len(X_test_df)} ({te_dist})")
 
             # --- b. 预处理 (fit on train_fold only) ---
             fold_datasets_raw = {
@@ -697,13 +722,35 @@ def main():
                     sel_idx,
                 )
 
-                for clf_name, metrics in fold_result.items():
-                    fold_metrics[(method, clf_name)].append(metrics)
-                    print(f"    {clf_name}: AUC={metrics['AUC']:.4f}  ACC={metrics['ACC']:.4f}  "
-                          f"Sens={metrics['Sens']:.4f}  Spec={metrics['Spec']:.4f}")
+                for clf_name, res_dict in fold_result.items():
+                    test_m = res_dict['test']
+                    train_m = res_dict['train']
+                    
+                    fold_metrics[(method, clf_name)].append(test_m)
+                    fold_train_metrics[(method, clf_name)].append(train_m)
+                    
+                    print(f"    {clf_name}: AUC={test_m['AUC']:.4f} (Tr:{train_m['AUC']:.4f})  "
+                          f"ACC={test_m['ACC']:.4f} (Tr:{train_m['ACC']:.4f})  "
+                          f"Sens={test_m['Sens']:.4f}  Spec={test_m['Spec']:.4f}")
 
         # --- 汇总 5 折结果 ---
         print(f"\n\n{'#'*72}")
+        print("### 训练集平均性能 (Train Set Results) ###")
+        for method in methods:
+            if len(methods) > 1:
+                print(f"  --- FS Method: {method} ---")
+            for clf_name in ['LR', 'RF', 'SVM', 'XGB', 'NN', 'LNN']:
+                key = (method, clf_name)
+                if key not in fold_train_metrics: 
+                    continue
+                tr_list = fold_train_metrics[key]
+                auc_tr = np.mean([m['AUC'] for m in tr_list])
+                acc_tr = np.mean([m['ACC'] for m in tr_list])
+                sens_tr = np.mean([m['Sens'] for m in tr_list])
+                spec_tr = np.mean([m['Spec'] for m in tr_list])
+                print(f"    {clf_name}: AUC={auc_tr:.4f}  ACC={acc_tr:.4f}  Sens={sens_tr:.4f}  Spec={spec_tr:.4f}")
+
+        print(f"\n{'#'*72}")
         print("### 五折交叉验证最终结果 (mean ± std) ###")
         print(f"{'#'*72}")
 

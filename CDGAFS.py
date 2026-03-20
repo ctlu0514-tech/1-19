@@ -124,36 +124,78 @@ def cdgafs_feature_selection(X, y, feature_list, theta, omega, population_size,
 
     # Step 2 & 3: 聚类（语义聚类或ISCD）
     cluster_names = []
+    
+    # --- 提前分离临床特征和影像组学特征 ---
+    rad_prefixes = ('T2_', 'ADC_', 'DWI_', 'CT_')
+    clinical_indices = []
+    rad_indices = []
+    for i, name in enumerate(feature_list_subset):
+        if name.startswith(rad_prefixes):
+            rad_indices.append(i)
+        else:
+            clinical_indices.append(i)
+            
+    if clinical_indices:
+        print(f"检测到 {len(clinical_indices)} 个临床特征 (非 {rad_prefixes} 开头)。")
+
     if use_semantic_clustering:
         print(f"\nStep 2: 使用语义预聚类...")
-        clusters, cluster_names = semantic_pre_clustering(feature_list_subset)
-        print(f"语义聚类完成，共 {len(clusters)} 个聚类。")
+        # 仅对影像组学特征进行语义聚类
+        rad_feature_names = [feature_list_subset[i] for i in rad_indices]
+        rad_clusters, rad_cluster_names = semantic_pre_clustering(rad_feature_names)
         
-        # 打印聚类分布
+        clusters = []
+        cluster_names = []
+        for i, c in enumerate(rad_clusters):
+            clusters.append([rad_indices[idx] for idx in c])
+            cluster_names.append(rad_cluster_names[i])
+            
+        print(f"影像特征语义聚类完成，共 {len(clusters)} 个聚类。")
+        
+        if clinical_indices:
+            clusters.append(clinical_indices)
+            cluster_names.append("Clinical_Comm")
+
         cluster_sizes = [len(c) for c in clusters]
         print(f"聚类大小分布: min={min(cluster_sizes)}, max={max(cluster_sizes)}, "
               f"mean={np.mean(cluster_sizes):.1f}")
         
-        # 计算相似度矩阵（仍然需要用于 GA 适应度计算）
-        print("\n计算相似度矩阵...")
+        print("\n计算总相似度矩阵...")
         similarity_matrix = compute_similarity_matrix(X_subset)
     else:
         # 原始 ISCD 流程
         print(f"\nStep 2: 构造特征图 (Pearson Only)...")
-        feature_graph = construct_pearson_only_graph(X_subset, theta)
         
-        similarity_matrix = compute_similarity_matrix(X_subset)
+        clusters = []
+        cluster_names = []
+        
+        if rad_indices:
+            X_rad = X_subset[:, rad_indices]
+            feature_graph = construct_pearson_only_graph(X_rad, theta)
+            
+            similarity_matrix = compute_similarity_matrix(X_subset)
 
-        print("\nStep 3: 进行社区检测...")
-        partition = iscd_algorithm_auto_k(feature_graph)
+            print("\nStep 3: 进行社区检测...")
+            partition = iscd_algorithm_auto_k(feature_graph)
 
-        clusters = defaultdict(list)
-        for node, community in partition.items():
-            clusters[community].append(node)
-        clusters = [cluster for cluster in clusters.values()]
-        # 为 ISCD 生成简单的社区名称
-        cluster_names = [f"ISCD_Comm_{i}" for i in range(len(clusters))]
-        print(f"检测到 {len(clusters)} 个社区。")
+            rad_clusters = defaultdict(list)
+            for node, community in partition.items():
+                rad_clusters[community].append(rad_indices[node])
+                
+            for c in rad_clusters.values():
+                clusters.append(c)
+                
+            cluster_names = [f"ISCD_Comm_{i}" for i in range(len(clusters))]
+            print(f"影像特征检测到 {len(clusters)} 个社区。")
+        else:
+            similarity_matrix = compute_similarity_matrix(X_subset)
+            
+        if clinical_indices:
+            clusters.append(clinical_indices)
+            cluster_names.append("Clinical_Comm")
+            print(f"已将临床特征单独划分为 Clinical_Comm 社区。")
+            
+        print(f"总计 {len(clusters)} 个社区。")
     
     # Step 4: 初始化种群并执行遗传算法
     print("\nStep 4: 执行遗传算法...")

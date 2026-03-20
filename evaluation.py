@@ -40,32 +40,56 @@ def evaluate_model_performance(X, y, selected_indices):
         valid_folds += 1
         
         model = LogisticRegressionCV(
-            Cs=10, cv=3, penalty='l2', solver='liblinear', 
+            Cs=10, cv=3, penalty='l2', solver='lbfgs', multi_class='auto',
             random_state=42, max_iter=1000,
-            # class_weight='balanced'  # <--- 保持这个（来自上次对话的修改）
+            class_weight='balanced'
         )
         model.fit(X_train, y_train)
         
         # --- 验证集 (Test) 指标 (原逻辑) ---
         y_pred = model.predict(X_test)
-        y_proba = model.predict_proba(X_test)[:, 1]
+        y_proba = model.predict_proba(X_test)
         
         metrics["acc"].append(accuracy_score(y_test, y_pred))
         metrics["f1"].append(f1_score(y_test, y_pred, average='macro'))
-        metrics["auc"].append(roc_auc_score(y_test, y_proba))
-        metrics["sens"].append(recall_score(y_test, y_pred, pos_label=1, average='binary'))
-        cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
-        TN, FP, FN, TP = cm.ravel()
-        specificity = TN / (TN + FP)
-        metrics["spec"].append(specificity)
+        
+        n_classes_fold = len(model.classes_)
+        try:
+            if n_classes_fold == 2:
+                metrics["auc"].append(roc_auc_score(y_test, y_proba[:, 1]))
+            else:
+                metrics["auc"].append(roc_auc_score(y_test, y_proba, multi_class='ovr', average='macro'))
+        except Exception:
+            metrics["auc"].append(0.5)
+
+        # Sensitivity / Specificity for multi-class (Macro Average)
+        cm = confusion_matrix(y_test, y_pred, labels=model.classes_)
+        sens_fold = []
+        spec_fold = []
+        for i in range(len(model.classes_)):
+            tp = cm[i, i]
+            fn = np.sum(cm[i, :]) - tp
+            fp = np.sum(cm[:, i]) - tp
+            tn = np.sum(cm) - tp - fn - fp
+            sens_fold.append(tp / (tp + fn) if (tp + fn) > 0 else 0.0)
+            spec_fold.append(tn / (tn + fp) if (tn + fp) > 0 else 0.0)
+        
+        metrics["sens"].append(np.mean(sens_fold))
+        metrics["spec"].append(np.mean(spec_fold))
 
         # --- [!!! 核心新增 !!!] ---
         # --- 训练集 (Train) 指标 ---
         y_pred_train = model.predict(X_train)
-        y_proba_train = model.predict_proba(X_train)[:, 1]
+        y_proba_train = model.predict_proba(X_train)
         
         metrics["acc_train"].append(accuracy_score(y_train, y_pred_train))
-        metrics["auc_train"].append(roc_auc_score(y_train, y_proba_train))
+        try:
+            if n_classes_fold == 2:
+                metrics["auc_train"].append(roc_auc_score(y_train, y_proba_train[:, 1]))
+            else:
+                metrics["auc_train"].append(roc_auc_score(y_train, y_proba_train, multi_class='ovr', average='macro'))
+        except Exception:
+            metrics["auc_train"].append(0.5)
         # --- [新增结束] ---
 
     if valid_folds == 0:
@@ -125,102 +149,76 @@ def print_summary_table(all_results, all_selected_indices, execution_times=None)
 
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.svm import SVC
-from sklearn.neural_network import MLPClassifier
-from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
-from sklearn.linear_model import RidgeClassifier
-
-# (复用 test13.py 中的 LiquidNeuralNetwork 类)
-class LiquidNeuralNetwork(BaseEstimator, ClassifierMixin):
-    def __init__(self, n_hidden=500, activation='tanh', alpha=1.0, random_state=None):
-        self.n_hidden = n_hidden
-        self.activation = activation
-        self.alpha = alpha
-        self.random_state = random_state
-
-    def fit(self, X, y):
-        X, y = check_X_y(X, y)
-        self.classes_ = np.unique(y)
-        if self.random_state is not None:
-            np.random.seed(self.random_state)
-        n_samples, n_features = X.shape
-        
-        self.input_weights_ = np.random.normal(size=[n_features, self.n_hidden])
-        self.bias_ = np.random.normal(size=[self.n_hidden])
-        
-        H = np.dot(X, self.input_weights_) + self.bias_
-        if self.activation == 'tanh':
-            H = np.tanh(H)
-        elif self.activation == 'relu':
-            H = np.maximum(H, 0)
-            
-        self.output_model_ = RidgeClassifier(alpha=self.alpha, class_weight='balanced')
-        self.output_model_.fit(H, y)
-        return self
-
-    def predict(self, X):
-        check_is_fitted(self)
-        X = check_array(X)
-        H = np.dot(X, self.input_weights_) + self.bias_
-        if self.activation == 'tanh':
-            H = np.tanh(H)
-        elif self.activation == 'relu':
-            H = np.maximum(H, 0)
-        return self.output_model_.predict(H)
-
-    def predict_proba(self, X):
-        check_is_fitted(self)
-        X = check_array(X)
-        H = np.dot(X, self.input_weights_) + self.bias_
-        if self.activation == 'tanh':
-            H = np.tanh(H)
-        elif self.activation == 'relu':
-            H = np.maximum(H, 0)
-        d = self.output_model_.decision_function(H)
-        if len(d.shape) == 1:
-            prob = 1 / (1 + np.exp(-d))
-            return np.vstack([1-prob, prob]).T
-        else:
-            exp_d = np.exp(d)
-            return exp_d / exp_d.sum(axis=1, keepdims=True)
+from sklearn.neighbors import KNeighborsClassifier
 
 def _build_model_pool():
     """返回统一的模型池字典，供 evaluate_single_fold 和 evaluate_multiple_models 共用。"""
-    from sklearn.base import clone as sk_clone
+    # Use 'lbfgs' or 'saga' for multinomial support in LogisticRegressionCV
     return {
-        'LR': LogisticRegressionCV(cv=5, penalty='l2', solver='liblinear', random_state=42, class_weight='balanced', max_iter=1000),
+        'LR': LogisticRegressionCV(cv=5, penalty='l2', solver='lbfgs', multi_class='auto', random_state=42, class_weight='balanced', max_iter=2000),
         'RF': RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced'),
         'SVM': SVC(probability=True, random_state=42, class_weight='balanced'),
         'XGB': GradientBoostingClassifier(random_state=42),
-        'NN': MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500, random_state=42),
-        'LNN': LiquidNeuralNetwork(n_hidden=500, random_state=42),
+        'KNN': KNeighborsClassifier(n_neighbors=5),
     }
 
 
 def _compute_metrics(model, X, y_true):
     """用已训练好的 model 在 (X, y_true) 上计算 AUC/ACC/Sens/Spec。"""
     y_pred = model.predict(X)
+    classes = np.unique(y_true)
+    n_classes = len(classes)
+    total_classes = len(model.classes_)
 
     # 获取概率
     if hasattr(model, "predict_proba"):
         try:
-            y_prob = model.predict_proba(X)[:, 1]
+            y_prob = model.predict_proba(X)
         except Exception:
-            y_prob = model.decision_function(X) if hasattr(model, "decision_function") else y_pred.astype(float)
+            y_prob = None
     elif hasattr(model, "decision_function"):
         y_prob = model.decision_function(X)
     else:
-        y_prob = y_pred.astype(float)
+        y_prob = None
 
+    # AUC calculation
     try:
-        auc = float(roc_auc_score(y_true, y_prob))
+        if y_prob is not None:
+            if total_classes == 2:
+                # Binary case: y_prob might be (n, 2) or (n,)
+                prob_to_use = y_prob[:, 1] if y_prob.ndim == 2 else y_prob
+                auc = float(roc_auc_score(y_true, prob_to_use))
+            else:
+                # Multi-class case
+                auc = float(roc_auc_score(y_true, y_prob, multi_class='ovr', average='macro'))
+        else:
+            auc = 0.5
     except Exception:
         auc = 0.5
 
     acc = float(accuracy_score(y_true, y_pred))
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    sens = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-    spec = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+    
+    # Macro Sensitivity (Recall) and Specificity
+    cm = confusion_matrix(y_true, y_pred, labels=model.classes_)
+    
+    sens_list = []
+    spec_list = []
+    for i in range(total_classes):
+        tp = cm[i, i]
+        fn = np.sum(cm[i, :]) - tp
+        fp = np.sum(cm[:, i]) - tp
+        tn = np.sum(cm) - tp - fn - fp
+        
+        # Sensitivity (Recall)
+        sens_i = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        # Specificity
+        spec_i = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        
+        sens_list.append(sens_i)
+        spec_list.append(spec_i)
+        
+    sens = float(np.mean(sens_list))
+    spec = float(np.mean(spec_list))
 
     return {"AUC": auc, "ACC": acc, "Sens": sens, "Spec": spec}
 
@@ -228,10 +226,16 @@ def _compute_metrics(model, X, y_true):
 def evaluate_single_fold(X_train, y_train, X_test, y_test, selected_idx):
     """
     五折交叉验证中单折的多模型评估。
-    在 train 上 fit，在 test 上 predict，返回每个模型的指标。
+    在 train 上 fit，在 test 上 predict，同时返回 train 和 test 的指标。
 
     Returns:
-        dict: { 'LR': {'AUC':…, 'ACC':…, 'Sens':…, 'Spec':…}, 'RF': … }
+        dict: {
+            'LR': {
+                'test': {'AUC':…, 'ACC':…, 'Sens':…, 'Spec':…},
+                'train': {'AUC':…, 'ACC':…, 'Sens':…, 'Spec':…}
+            },
+            ...
+        }
     """
     X_train_sel = X_train[:, selected_idx]
     X_test_sel = X_test[:, selected_idx]
@@ -241,7 +245,10 @@ def evaluate_single_fold(X_train, y_train, X_test, y_test, selected_idx):
 
     for model_name, model in models.items():
         model.fit(X_train_sel, y_train)
-        fold_results[model_name] = _compute_metrics(model, X_test_sel, y_test)
+        fold_results[model_name] = {
+            'test': _compute_metrics(model, X_test_sel, y_test),
+            'train': _compute_metrics(model, X_train_sel, y_train)
+        }
 
     return fold_results
 
@@ -256,15 +263,8 @@ def evaluate_multiple_models(datasets, selected_idx):
     # 仅使用选定特征
     X_train_sel = X_train_full[:, selected_idx]
     
-    # 定义模型池 (均开启 class_weight='balanced' 以解决 Spec 低的问题)
-    models = {
-        'LR': LogisticRegressionCV(cv=5, penalty='l2', solver='liblinear', random_state=42, class_weight='balanced', max_iter=1000),
-        'RF': RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced'),
-        'SVM': SVC(probability=True, random_state=42, class_weight='balanced'),
-        'XGB': GradientBoostingClassifier(random_state=42), # XGBoost原生库可能没装，用Sklearn的GBDT近似，注意GBDT没有简单的class_weight参数，通常需要sample_weight
-        'NN': MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500, random_state=42), # MLP也没有class_weight
-        'LNN': LiquidNeuralNetwork(n_hidden=500, random_state=42)
-    }
+    # 定义模型池
+    models = _build_model_pool()
 
     all_model_results = {}
 
@@ -274,34 +274,7 @@ def evaluate_multiple_models(datasets, selected_idx):
         
         model_res = {}
         for ds_name, (X, y_true) in datasets.items():
-            X_sel = X[:, selected_idx]
-            
-            y_pred = model.predict(X_sel)
-            
-            # 获取概率
-            if hasattr(model, "predict_proba"):
-                try:
-                    y_prob = model.predict_proba(X_sel)[:, 1]
-                except:
-                    # Fallback if probability fails
-                    y_prob = model.decision_function(X_sel) if hasattr(model, "decision_function") else y_pred
-            elif hasattr(model, "decision_function"):
-                y_prob = model.decision_function(X_sel)
-            else:
-                y_prob = y_pred
-
-            # 计算指标
-            try:
-                auc = float(roc_auc_score(y_true, y_prob))
-            except:
-                auc = 0.5
-            
-            acc = float(accuracy_score(y_true, y_pred))
-            tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-            sens = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-            spec = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
-
-            model_res[ds_name] = {"AUC": auc, "ACC": acc, "Sens": sens, "Spec": spec}
+            model_res[ds_name] = _compute_metrics(model, X[:, selected_idx], y_true)
         
         all_model_results[model_name] = model_res
 

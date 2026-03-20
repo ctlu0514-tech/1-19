@@ -90,19 +90,33 @@ def allocate_quota_by_quality(clusters, fisher_scores, total_k,
     raw_avg_scores = np.array(raw_avg_scores)
     cluster_sizes = np.array(cluster_sizes)
     
+    clinical_idx = -1
+    clinical_quota = 0
+    if cluster_names is not None:
+        try:
+            clinical_idx = cluster_names.index("Clinical_Comm")
+            clinical_k_target = 5
+            clinical_quota = min(clinical_k_target, len(clusters[clinical_idx]))
+            cluster_quality_scores[clinical_idx] = -np.inf
+        except ValueError:
+            pass
+
     print(f"\n{'='*60}")
     print(f"[方案C: 两阶段配额分配] 目标特征数: {total_k}")
+    if clinical_idx != -1:
+        print(f"  ->> 发现 Clinical_Comm：预留 {clinical_quota} 个配额。")
     print(f"{'='*60}")
     print(f"  社区数量: {n_clusters}")
-    print(f"  社区数量: {n_clusters}")
-    print(f"  社区调整后质量: min={cluster_quality_scores.min():.6f}, "
-          f"max={cluster_quality_scores.max():.6f}, mean={cluster_quality_scores.mean():.6f}")
+    
+    valid_scores = cluster_quality_scores[cluster_quality_scores > -np.inf]
+    if len(valid_scores) > 0:
+        print(f"  社区调整后质量: min={valid_scores.min():.6f}, max={valid_scores.max():.6f}, mean={valid_scores.mean():.6f}")
     
     # ========== 阶段1: 筛选高质量社区 ==========
     # 计算需要激活的社区数
-    # 改为至少选1个
-    n_active = max(1, int(n_clusters * top_cluster_ratio))
-    n_active = min(n_active, n_clusters)  # 不能超过总社区数
+    eff_n_clusters = n_clusters - 1 if clinical_idx != -1 else n_clusters
+    n_active = max(1, int(eff_n_clusters * top_cluster_ratio))
+    n_active = min(n_active, eff_n_clusters)  # 不能超过有效分群数量
     
     # 按质量排序，选择 Top N 个社区
     sorted_indices = np.argsort(cluster_quality_scores)[::-1]
@@ -138,7 +152,8 @@ def allocate_quota_by_quality(clusters, fisher_scores, total_k,
     # 确定性分配逻辑 (Deterministic Quota Allocation)
     # 期望配额
     expected_quotas = np.zeros(n_clusters)
-    expected_quotas[active_indices] = weights * total_k
+    remaining_total_k = total_k - clinical_quota if clinical_idx != -1 else total_k
+    expected_quotas[active_indices] = weights * remaining_total_k
     
     # 1. 整数部分分配
     int_quotas = np.floor(expected_quotas).astype(int)
@@ -149,6 +164,9 @@ def allocate_quota_by_quality(clusters, fisher_scores, total_k,
     actual_int_quotas = np.minimum(int_quotas, remaining_capacity)
     remainder_quotas = expected_quotas - int_quotas # 小数部分
     
+    if clinical_idx != -1:
+        actual_int_quotas[clinical_idx] = clinical_quota
+        
     # 计算当前已分配的总数
     current_allocated = np.sum(actual_int_quotas)
     to_allocate = total_k - current_allocated
@@ -266,8 +284,8 @@ def allocate_quota_by_quality(clusters, fisher_scores, total_k,
             print(f"    #{rank}: {c_name} | 配额={quotas[idx]} | 大小={cluster_sizes[idx]} | "
                   f"FS_Stats(min={stats[0]:.4f}, max={stats[1]:.4f}, var={stats[2]:.4f}, avg={stats[3]:.4f}, top20={stats[4]:.4f})")
     
-    # 打印被跳过的社区
-    zero_quota_mask = quotas == 0
+    # 打印被跳过的社区 (临床社区除外)
+    zero_quota_mask = (quotas == 0) & (np.arange(n_clusters) != clinical_idx)
     n_skipped = np.sum(zero_quota_mask)
     if n_skipped > 0:
         skipped_fs = raw_avg_scores[zero_quota_mask]
@@ -664,8 +682,8 @@ def genetic_algorithm(population, fitness_values, X_train, y_train, clusters, om
     if ca_values is None:
         # 兼容性处理，如果没传，先算一次
         fitness_values, ca_values, den_values = calculate_fitness(
-            population, X_train, y_train, similarity_matrix, n_jobs=10, cv_folds=cv_folds
-        )
+            population, X_train, y_train, similarity_matrix, n_jobs=10
+        ) #, cv_folds=cv_folds
 
     for generation in range(generations):
         
@@ -677,8 +695,8 @@ def genetic_algorithm(population, fitness_values, X_train, y_train, clusters, om
         
         # Step 3: 计算新种群的适应度值
         new_fitness_values, new_ca_values, new_den_values = calculate_fitness(
-            new_population, X_train, y_train, similarity_matrix, n_jobs=10, cv_folds=cv_folds
-        )
+            new_population, X_train, y_train, similarity_matrix, n_jobs=10
+        ) #, cv_folds=cv_folds
         
         # Step 4: 合并新旧种群
         combined_population = population + new_population
@@ -715,12 +733,12 @@ def genetic_algorithm(population, fitness_values, X_train, y_train, clusters, om
         den_min = min(den_values)
         den_mean = np.mean(den_values)
         
-        print(f"Gen {generation + 1}: Best Fitness = {fit_max:.4f} (CA={best_ca:.4f}, Den={best_den:.6f}) | "
-              f"Min/Mean/Std Fit = {fit_min:.4f}/{fit_mean:.4f}/{fit_std:.4f} | "
-              f"Den Min/Mean = {den_min:.6f}/{den_mean:.6f} | "
-              f"Unique = {unique_count}/{population_size} | "
-              f"Avg Hamming Dist = {diversity_score:.2f} | "
-              f"Repair Ratio = {repair_ratio:.1%}")
+        # print(f"Gen {generation + 1}: Best Fitness = {fit_max:.4f} (CA={best_ca:.4f}, Den={best_den:.6f}) | "
+        #       f"Min/Mean/Std Fit = {fit_min:.4f}/{fit_mean:.4f}/{fit_std:.4f} | "
+        #       f"Den Min/Mean = {den_min:.6f}/{den_mean:.6f} | "
+        #       f"Unique = {unique_count}/{population_size} | "
+        #       f"Avg Hamming Dist = {diversity_score:.2f} | "
+        #       f"Repair Ratio = {repair_ratio:.1%}")
 
         if repair_stats:
             total_children = repair_stats["total_children"]
@@ -744,14 +762,14 @@ def genetic_algorithm(population, fitness_values, X_train, y_train, clusters, om
             else:
                 top_str = "n/a"
 
-            print(
-                f"  Repair Gene Flips: total={repair_stats['gene_changes']} | "
-                f"avg/child={avg_gene_changes:.2f} ({avg_gene_pct:.1f}%)"
-            )
-            print(
-                f"  Repair Cluster Delta: total_abs={total_abs} | "
-                f"avg_abs/child={avg_abs_per_child:.2f} | net_total={net_total} | "
-                f"top_abs={top_str}"
-            )
+            # print(
+            #     f"  Repair Gene Flips: total={repair_stats['gene_changes']} | "
+            #     f"avg/child={avg_gene_changes:.2f} ({avg_gene_pct:.1f}%)"
+            # )
+            # print(
+            #     f"  Repair Cluster Delta: total_abs={total_abs} | "
+            #     f"avg_abs/child={avg_abs_per_child:.2f} | net_total={net_total} | "
+            #     f"top_abs={top_str}"
+            # )
 
     return population, fitness_values
